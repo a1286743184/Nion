@@ -86,7 +86,8 @@ fun NoteSearchScreen(
         try {
             // 调用 Rust 核心库全文搜索：query, checklistId=null（搜索所有笔记清单）
             val notes = withContext(Dispatchers.IO) {
-                app.core().searchNotes(query.trim(), null).map { it.toUi() }
+                // includeChildren=false：保持文档式搜索语义，只搜根笔记（UI 口径）
+                app.core().searchNotes(query.trim(), null, false).map { it.toUi() }
             }
             results = notes
         } catch (_: Exception) {

@@ -1133,7 +1133,8 @@ class TaskViewModel(
     suspend fun searchNotesGlobal(query: String): List<TaskItem> {
         return try {
             withContext(Dispatchers.IO) {
-                core.searchNotes(query, null).map { it.toUi() }
+                // includeChildren=false：UI 搜索保持文档式语义（只搜根笔记）
+                core.searchNotes(query, null, false).map { it.toUi() }
             }
         } catch (_: Exception) {
             emptyList()

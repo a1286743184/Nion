@@ -48,6 +48,8 @@ import java.util.UUID
  * @property model 模型名称
  * @property baseUrl 自定义 baseUrl（仅"自定义"provider 需要）
  * @property apiType API 类型名
+ * @property reasoningEffort 思考强度档位（来自上游模型目录的 supported_efforts）。
+ *           null/"默认" = 不发送 effort 参数，跟随上游默认（透传语义）
  */
 data class SavedConfig(
     val id: String,
@@ -56,6 +58,7 @@ data class SavedConfig(
     val model: String,
     val baseUrl: String,
     val apiType: String,
+    val reasoningEffort: String? = null,
 )
 
 /**
@@ -219,6 +222,31 @@ class CompanionViewModel(
     /** 当前使用的模型名称 */
     var modelName by mutableStateOf<String?>(null)
         private set
+
+    /**
+     * 当前使用的思考强度档位 —— 来自该模型在上游目录中声明的 supported_efforts。
+     * null = 不发送 effort 参数（跟随上游默认，透传语义）。
+     * 随配置切换（saveApiConfig / switchToConfig / updateConfig）同步更新。
+     */
+    var reasoningEffort by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * 最近一次从上游拉取的模型目录（含 effort 档位、多模态等元数据）。
+     * 用途：① 发图前校验当前模型 supports_image；② 配置页展示模型能力标签。
+     * 由 [updateModelCatalog] 写入；App 冷启动后为空（用户进配置页拉一次即有）。
+     */
+    var modelCatalog by mutableStateOf<List<ModelMetadata>>(emptyList())
+        private set
+
+    /**
+     * 更新共享模型目录（配置页拉取成功后调用）。
+     *
+     * @param catalog 拉取到的模型元数据列表
+     */
+    fun updateModelCatalog(catalog: List<ModelMetadata>) {
+        modelCatalog = catalog
+    }
 
     /** 是否已完成初始化设置检查（防止启动时闪烁） */
     var isInitialized by mutableStateOf(false)
@@ -640,6 +668,7 @@ class CompanionViewModel(
                     model = obj.getString("model"),
                     baseUrl = obj.optString("baseUrl", ""),
                     apiType = obj.optString("apiType", "OPENAI_COMPATIBLE"),
+                    reasoningEffort = obj.optString("reasoningEffort", "").takeIf { it.isNotEmpty() },
                 ))
             }
             savedConfigs = configs
@@ -821,6 +850,9 @@ class CompanionViewModel(
                     put("model", config.model)
                     put("baseUrl", config.baseUrl)
                     put("apiType", config.apiType)
+                    if (!config.reasoningEffort.isNullOrEmpty()) {
+                        put("reasoningEffort", config.reasoningEffort)
+                    }
                 })
             }
             core.setSetting("llm_saved_configs", arr.toString())
@@ -1092,12 +1124,14 @@ class CompanionViewModel(
      * @param key      API 密钥
      * @param model    用户指定的模型名
      * @param baseUrl  自定义 baseUrl（仅"自定义"provider 需要）
+     * @param effort   思考强度档位；null = 不发送该参数（跟随上游默认）
      */
     fun saveApiConfig(
         provider: ProviderConfig,
         key: String,
         model: String = "",
         baseUrl: String = "",
+        effort: String? = null,
     ) {
         val actualModel = model
         val actualBaseUrl = if (provider.name == "自定义") baseUrl else provider.baseUrl
@@ -1114,6 +1148,7 @@ class CompanionViewModel(
 
         apiKey = key
         modelName = actualModel
+        reasoningEffort = effort
         currentProvider = provider.copy(baseUrl = actualBaseUrl)
 
         // 更新或新增到多配置列表
@@ -1121,7 +1156,7 @@ class CompanionViewModel(
         val newConfigs = if (existing != null) {
             // 更新已存在的配置
             savedConfigs.map { c ->
-                if (c.id == existing.id) c.copy(apiKey = key, baseUrl = actualBaseUrl, apiType = provider.apiType.name)
+                if (c.id == existing.id) c.copy(apiKey = key, baseUrl = actualBaseUrl, apiType = provider.apiType.name, reasoningEffort = effort)
                 else c
             }
         } else {
@@ -1133,6 +1168,7 @@ class CompanionViewModel(
                 model = actualModel,
                 baseUrl = actualBaseUrl,
                 apiType = provider.apiType.name,
+                reasoningEffort = effort,
             )
         }
         savedConfigs = newConfigs
@@ -1151,6 +1187,7 @@ class CompanionViewModel(
         val config = savedConfigs.find { it.id == configId } ?: return
         apiKey = config.apiKey
         modelName = config.model
+        reasoningEffort = config.reasoningEffort
         val apiType = try {
             ApiType.valueOf(config.apiType)
         } catch (_: Exception) {
@@ -1202,6 +1239,7 @@ class CompanionViewModel(
         key: String,
         model: String,
         baseUrl: String,
+        effort: String? = null,
     ) {
         val old = savedConfigs.find { it.id == configId } ?: return
         val actualBaseUrl = if (provider.name == "自定义") baseUrl else provider.baseUrl
@@ -1213,6 +1251,7 @@ class CompanionViewModel(
             model = actualModel,
             baseUrl = actualBaseUrl,
             apiType = provider.apiType.name,
+            reasoningEffort = effort,
         )
         savedConfigs = savedConfigs.map { if (it.id == configId) updated else it }
         saveConfigsToStorage()
@@ -1228,6 +1267,7 @@ class CompanionViewModel(
             } catch (_: Exception) {}
             apiKey = key
             modelName = actualModel
+            reasoningEffort = effort
             currentProvider = provider.copy(baseUrl = actualBaseUrl)
         }
     }
@@ -1508,6 +1548,17 @@ class CompanionViewModel(
      * @param uri 用户选中的图片 URI
      */
     fun addPendingImage(uri: android.net.Uri) {
+        // 发图前校验：当前模型在上游目录中明确声明不支持图片时立即提示，
+        // 不必等 API 报错再返工（目录无该模型或未声明 supports_image 时不拦截）
+        modelName?.let { name ->
+            val meta = modelCatalog.find { it.id == name }
+            if (meta?.supportsImage == false) {
+                appendAssistantMessage(
+                    "当前模型「$name」不支持图片输入。请在配置中换一个支持视觉的模型（拉取列表里标有\"可看图\"的），或直接文字描述内容。"
+                )
+                return
+            }
+        }
         pendingImageUris = pendingImageUris + uri
         // 立即在后台编码，结果存入缓存
         viewModelScope.launch(Dispatchers.IO) {
@@ -1804,19 +1855,25 @@ class CompanionViewModel(
             }
 
             // 从结果 JSON 中提取实体名称（create/update 返回完整实体对象）
-            // note 类型用 "note" 键而非 entityType 原值
+            // note 类型用 "note" 键；互转场景下实体实际 kind 可能与 entity_type 不同，
+            // 因此两个键都尝试一次（工具层已保证两个键指向同一实体）
             val entityObj = resultJson.optJSONObject(if (entityType == "note") "note" else entityType)
+                ?: resultJson.optJSONObject("task")
+                ?: resultJson.optJSONObject("note")
             val entityName = entityObj?.optString("name", "")?.takeIf { it.isNotEmpty() }
                 ?: entityObj?.optString("title", "")?.takeIf { it.isNotEmpty() }
                 ?: ""
 
             when (toolName) {
                 "query" -> {
-                    // 统计查询结果数量
-                    val count = if (resultJson.has("checklists")) resultJson.getJSONArray("checklists").length()
-                        else if (resultJson.has("groups")) resultJson.getJSONArray("groups").length()
-                        else if (resultJson.has("tasks")) resultJson.getJSONArray("tasks").length()
-                        else 0
+                    // 统计查询结果数量。
+                    // 实体查询（task / note）统一返回 items 数组；checklists / groups 保留各自键名。
+                    val count = when {
+                        resultJson.has("items") -> resultJson.optJSONArray("items")?.length() ?: 0
+                        resultJson.has("checklists") -> resultJson.getJSONArray("checklists").length()
+                        resultJson.has("groups") -> resultJson.getJSONArray("groups").length()
+                        else -> 0
+                    }
                     val subKey = if (count > 0) "query_results" else "query_empty"
                     ToolPhrasePool.pick(companionStyle, subKey, mapOf("count" to count.toString(), "label" to entityLabel))
                 }
@@ -1889,6 +1946,7 @@ class CompanionViewModel(
                 model = model,
                 messages = apiMessages,
                 currentRoute = currentRoute,
+                reasoningEffort = reasoningEffort,
                 onTextDelta = { delta ->
                     // 追加到 StringBuilder（O(1) 均摊），替代 O(n) 的字符串拼接
                     synchronized(streamingBuilderLock) { streamingBuilder.append(delta) }
@@ -1904,7 +1962,14 @@ class CompanionViewModel(
                 Log.e(TAG, "API 失败: $err")
                 endStreaming()
                 toolExecutionStatus = null
-                appendAssistantMessage("抱歉，出了点问题：$err")
+                // 本轮消息带图片且报错疑似"模型不支持视觉"时，用人话提示换模型，
+                // 而不是把原始 API 错误直接抛给用户
+                val hasImagesThisTurn = (conversationHistory.lastOrNull()?.optString("role") == "user" &&
+                    conversationHistory.lastOrNull()?.opt("content") is JSONArray)
+                val friendlyErr = if (hasImagesThisTurn) {
+                    ModelCatalog.imageNotSupportedHint(err, model) ?: "抱歉，出了点问题：$err"
+                } else null
+                appendAssistantMessage(friendlyErr ?: "抱歉，出了点问题：$err")
                 break
             }
 

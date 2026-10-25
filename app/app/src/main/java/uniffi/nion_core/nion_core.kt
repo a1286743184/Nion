@@ -660,6 +660,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_nion_core_checksum_method_nioncore_create_task(
     ): Short
+    external fun uniffi_nion_core_checksum_method_nioncore_create_task_ex(
+    ): Short
     external fun uniffi_nion_core_checksum_method_nioncore_delete_checklist(
     ): Short
     external fun uniffi_nion_core_checksum_method_nioncore_delete_conversation(
@@ -758,6 +760,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_nion_core_checksum_method_nioncore_update_task(
     ): Short
+    external fun uniffi_nion_core_checksum_method_nioncore_update_task_full(
+    ): Short
     external fun uniffi_nion_core_checksum_method_nioncore_update_task_group(
     ): Short
     external fun uniffi_nion_core_checksum_method_nioncore_update_task_parent(
@@ -811,6 +815,8 @@ external fun uniffi_nion_core_fn_method_nioncore_create_local_playlist(`ptr`: Lo
 external fun uniffi_nion_core_fn_method_nioncore_create_sticker(`ptr`: Long,`tag`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`filePath`: RustBuffer.ByValue,`mimeType`: RustBuffer.ByValue,`fileSize`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_nion_core_fn_method_nioncore_create_task(`ptr`: Long,`name`: RustBuffer.ByValue,`description`: RustBuffer.ByValue,`priority`: RustBuffer.ByValue,`categoryId`: RustBuffer.ByValue,`parentId`: RustBuffer.ByValue,`groupId`: RustBuffer.ByValue,`recurrenceRule`: RustBuffer.ByValue,`recurrenceReminderTime`: RustBuffer.ByValue,`reminder`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_nion_core_fn_method_nioncore_create_task_ex(`ptr`: Long,`name`: RustBuffer.ByValue,`description`: RustBuffer.ByValue,`priority`: RustBuffer.ByValue,`categoryId`: RustBuffer.ByValue,`parentId`: RustBuffer.ByValue,`groupId`: RustBuffer.ByValue,`recurrenceRule`: RustBuffer.ByValue,`recurrenceReminderTime`: RustBuffer.ByValue,`reminder`: RustBuffer.ByValue,`kind`: RustBuffer.ByValue,`expectedMinutes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_nion_core_fn_method_nioncore_delete_checklist(`ptr`: Long,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
@@ -890,7 +896,7 @@ external fun uniffi_nion_core_fn_method_nioncore_reorder_tasks(`ptr`: Long,`orde
 ): Unit
 external fun uniffi_nion_core_fn_method_nioncore_save_conversation(`ptr`: Long,`id`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`messages`: RustBuffer.ByValue,`apiHistory`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_nion_core_fn_method_nioncore_search_notes(`ptr`: Long,`query`: RustBuffer.ByValue,`checklistId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_nion_core_fn_method_nioncore_search_notes(`ptr`: Long,`query`: RustBuffer.ByValue,`checklistId`: RustBuffer.ByValue,`includeChildren`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_nion_core_fn_method_nioncore_set_setting(`ptr`: Long,`key`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -909,6 +915,8 @@ external fun uniffi_nion_core_fn_method_nioncore_update_checklist_type(`ptr`: Lo
 external fun uniffi_nion_core_fn_method_nioncore_update_group(`ptr`: Long,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`color`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_nion_core_fn_method_nioncore_update_task(`ptr`: Long,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`description`: RustBuffer.ByValue,`priority`: RustBuffer.ByValue,`status`: RustBuffer.ByValue,`categoryId`: RustBuffer.ByValue,`reminder`: RustBuffer.ByValue,`groupId`: RustBuffer.ByValue,`recurrenceRule`: RustBuffer.ByValue,`recurrenceReminderTime`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_nion_core_fn_method_nioncore_update_task_full(`ptr`: Long,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`description`: RustBuffer.ByValue,`priority`: RustBuffer.ByValue,`status`: RustBuffer.ByValue,`kind`: RustBuffer.ByValue,`expectedMinutes`: RustBuffer.ByValue,`clearExpectedMinutes`: Byte,`categoryId`: RustBuffer.ByValue,`setGroup`: Byte,`groupId`: RustBuffer.ByValue,`setParent`: Byte,`parentId`: RustBuffer.ByValue,`reminder`: RustBuffer.ByValue,`clearReminder`: Byte,`recurrenceRule`: RustBuffer.ByValue,`recurrenceReminderTime`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_nion_core_fn_method_nioncore_update_task_group(`ptr`: Long,`taskId`: RustBuffer.ByValue,`groupId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1066,7 +1074,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_nion_core_checksum_method_nioncore_create_sticker() != 29120.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_nion_core_checksum_method_nioncore_create_task() != 3116.toShort()) {
+    if (lib.uniffi_nion_core_checksum_method_nioncore_create_task() != 42901.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_nion_core_checksum_method_nioncore_create_task_ex() != 9100.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nion_core_checksum_method_nioncore_delete_checklist() != 38463.toShort()) {
@@ -1084,7 +1095,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_nion_core_checksum_method_nioncore_delete_sticker() != 48449.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_nion_core_checksum_method_nioncore_delete_task() != 53518.toShort()) {
+    if (lib.uniffi_nion_core_checksum_method_nioncore_delete_task() != 24195.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nion_core_checksum_method_nioncore_get_attachments() != 50172.toShort()) {
@@ -1186,7 +1197,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_nion_core_checksum_method_nioncore_save_conversation() != 11459.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_nion_core_checksum_method_nioncore_search_notes() != 40623.toShort()) {
+    if (lib.uniffi_nion_core_checksum_method_nioncore_search_notes() != 14008.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nion_core_checksum_method_nioncore_set_setting() != 44047.toShort()) {
@@ -1214,6 +1225,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nion_core_checksum_method_nioncore_update_task() != 20380.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_nion_core_checksum_method_nioncore_update_task_full() != 35879.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nion_core_checksum_method_nioncore_update_task_group() != 57415.toShort()) {
@@ -1677,7 +1691,22 @@ public interface NionCoreInterface {
      */
     fun `createSticker`(`tag`: kotlin.String, `fileName`: kotlin.String, `filePath`: kotlin.String, `mimeType`: kotlin.String, `fileSize`: kotlin.Long): StickerData
     
+    /**
+     * 创建实体（默认 kind = "task"）。
+     *
+     * 保留这个签名是为了让既有的 UI 路径与测试不必逐个改参数；
+     * 需要显式指定 kind / expected_minutes 的调用方（AI 工具层、笔记编辑器、
+     * 预计时长表单）使用 [`create_task_ex`]。
+     */
     fun `createTask`(`name`: kotlin.String, `description`: kotlin.String?, `priority`: kotlin.String, `categoryId`: kotlin.String?, `parentId`: kotlin.String?, `groupId`: kotlin.String?, `recurrenceRule`: kotlin.String?, `recurrenceReminderTime`: kotlin.String?, `reminder`: kotlin.String?): TaskData
+    
+    /**
+     * 创建实体，可显式指定 kind 与预计时长（B3 起的主入口）。
+     *
+     * @param kind             "task"（可勾选）或 "note"（笔记）；其他值按 "task" 处理
+     * @param expected_minutes 预计总工作量（分钟），None = 未规划
+     */
+    fun `createTaskEx`(`name`: kotlin.String, `description`: kotlin.String?, `priority`: kotlin.String, `categoryId`: kotlin.String?, `parentId`: kotlin.String?, `groupId`: kotlin.String?, `recurrenceRule`: kotlin.String?, `recurrenceReminderTime`: kotlin.String?, `reminder`: kotlin.String?, `kind`: kotlin.String, `expectedMinutes`: kotlin.Long?): TaskData
     
     fun `deleteChecklist`(`id`: kotlin.String): kotlin.Boolean
     
@@ -1702,6 +1731,16 @@ public interface NionCoreInterface {
      */
     fun `deleteSticker`(`id`: kotlin.String): kotlin.Boolean
     
+    /**
+     * 删除实体，并把它的**直接子项上移一级**（挂到被删实体的父级），
+     * 同时清理双向关联里指向它的悬空 ID。
+     *
+     * 为什么不是级联删除：用户在确认框里看到的是「只删除当前项，N 个子项将上移一级」，
+     * 语义必须与文案一致。旧实现只删当前行，子项 `parent_id` 会指向已不存在的记录，
+     * 树形列表里这些子项直接消失但数据仍在（悬空行）。
+     *
+     * 全部操作在一个事务内：删除、子项改挂、关联清理要么都成功要么都不发生。
+     */
     fun `deleteTask`(`id`: kotlin.String): kotlin.Boolean
     
     /**
@@ -1876,11 +1915,19 @@ public interface NionCoreInterface {
     fun `saveConversation`(`id`: kotlin.String, `title`: kotlin.String, `messages`: kotlin.String, `apiHistory`: kotlin.String): ConversationData
     
     /**
-     * 全文搜索笔记：匹配笔记的标题（name）和正文（description）。
-     * 可选指定 checklist_id 限定搜索范围；None 时搜索所有笔记型清单。
-     * query 不区分大小写，使用 SQL LIKE 模糊匹配。
+     * 笔记搜索 / 枚举。
+     *
+     * 语义（B1 起统一为「实体 kind 驱动」）：
+     * - `query = Some(q)`：按标题(name)与正文(description)做不区分大小写的 LIKE 模糊匹配；
+     * - `query = None`：不按关键词过滤，直接枚举笔记（`checklist_id` 给定时限定该清单，
+     * 未给定时跨全部清单枚举）——供 AI 工具「先看看有什么笔记」使用；
+     * - `include_children = false`：保持文档式搜索语义，只返回根节点（`parent_id IS NULL`）；
+     * `true` 时把子笔记也纳入结果 —— AI 工具需要完整视图，UI 搜索保持原语义。
+     *
+     * 只返回 `kind = 'note'` 的实体：任务型清单里手动建的任务不会混进笔记搜索。
+     * 返回按 `updated_at DESC` 排序（枚举时同样如此，最近的笔记在前）。
      */
-    fun `searchNotes`(`query`: kotlin.String, `checklistId`: kotlin.String?): List<TaskData>
+    fun `searchNotes`(`query`: kotlin.String?, `checklistId`: kotlin.String?, `includeChildren`: kotlin.Boolean): List<TaskData>
     
     fun `setSetting`(`key`: kotlin.String, `value`: kotlin.String)
     
@@ -1930,6 +1977,25 @@ public interface NionCoreInterface {
     fun `updateGroup`(`id`: kotlin.String, `name`: kotlin.String, `color`: kotlin.String?): GroupData
     
     fun `updateTask`(`id`: kotlin.String, `name`: kotlin.String?, `description`: kotlin.String?, `priority`: kotlin.String?, `status`: kotlin.String?, `categoryId`: kotlin.String?, `reminder`: kotlin.String?, `groupId`: kotlin.String?, `recurrenceRule`: kotlin.String?, `recurrenceReminderTime`: kotlin.String?): TaskData
+    
+    /**
+     * 组合更新：字段 + 归属在一次事务内提交（B1 的工具诚实化基础）。
+     *
+     * 为什么需要它：历史上归属变更（parent / group / checklist）走各自的独立接口
+     * 各自自动提交，字段更新走 `update_task`，组合操作既没有事务，还会在「只改归属」
+     * 时被 `update_task` 的 `No fields to update` 守卫打成假失败 —— 数据其实已经写进去了，
+     * 工具却回报错误，模型据此自圆其说。
+     *
+     * 事务内顺序：先做环校验（沿 parent 链上溯，拒绝自环与 A→B→A），再写全部字段，
+     * 最后级联子孙归属；任一步失败整体回滚，不会留下写了一半的实体。
+     *
+     * UniFFI 约束：不支持嵌套 Option，因此「未提供 / 显式置空」用标志位区分。
+     * - `set_group = true` 时应用 `group_id`（None 表示清除分组）
+     * - `set_parent = true` 时应用 `parent_id`（None 表示提升为根）
+     * - `clear_expected_minutes = true` 时清除预计时长（7.9 要求可清除）
+     * - `clear_reminder = true` 时清除一次性提醒
+     */
+    fun `updateTaskFull`(`id`: kotlin.String, `name`: kotlin.String?, `description`: kotlin.String?, `priority`: kotlin.String?, `status`: kotlin.String?, `kind`: kotlin.String?, `expectedMinutes`: kotlin.Long?, `clearExpectedMinutes`: kotlin.Boolean, `categoryId`: kotlin.String?, `setGroup`: kotlin.Boolean, `groupId`: kotlin.String?, `setParent`: kotlin.Boolean, `parentId`: kotlin.String?, `reminder`: kotlin.String?, `clearReminder`: kotlin.Boolean, `recurrenceRule`: kotlin.String?, `recurrenceReminderTime`: kotlin.String?): TaskData
     
     /**
      * 更新任务的分组归属：将任务移到指定分组，或移出分组（group_id = None）。
@@ -2254,6 +2320,13 @@ open class NionCore: Disposable, AutoCloseable, NionCoreInterface
     
 
     
+    /**
+     * 创建实体（默认 kind = "task"）。
+     *
+     * 保留这个签名是为了让既有的 UI 路径与测试不必逐个改参数；
+     * 需要显式指定 kind / expected_minutes 的调用方（AI 工具层、笔记编辑器、
+     * 预计时长表单）使用 [`create_task_ex`]。
+     */
     @Throws(NionException::class)override fun `createTask`(`name`: kotlin.String, `description`: kotlin.String?, `priority`: kotlin.String, `categoryId`: kotlin.String?, `parentId`: kotlin.String?, `groupId`: kotlin.String?, `recurrenceRule`: kotlin.String?, `recurrenceReminderTime`: kotlin.String?, `reminder`: kotlin.String?): TaskData {
             return FfiConverterTypeTaskData.lift(
     callWithHandle {
@@ -2261,6 +2334,26 @@ open class NionCore: Disposable, AutoCloseable, NionCoreInterface
     UniffiLib.uniffi_nion_core_fn_method_nioncore_create_task(
         it,
         FfiConverterString.lower(`name`),FfiConverterOptionalString.lower(`description`),FfiConverterString.lower(`priority`),FfiConverterOptionalString.lower(`categoryId`),FfiConverterOptionalString.lower(`parentId`),FfiConverterOptionalString.lower(`groupId`),FfiConverterOptionalString.lower(`recurrenceRule`),FfiConverterOptionalString.lower(`recurrenceReminderTime`),FfiConverterOptionalString.lower(`reminder`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 创建实体，可显式指定 kind 与预计时长（B3 起的主入口）。
+     *
+     * @param kind             "task"（可勾选）或 "note"（笔记）；其他值按 "task" 处理
+     * @param expected_minutes 预计总工作量（分钟），None = 未规划
+     */
+    @Throws(NionException::class)override fun `createTaskEx`(`name`: kotlin.String, `description`: kotlin.String?, `priority`: kotlin.String, `categoryId`: kotlin.String?, `parentId`: kotlin.String?, `groupId`: kotlin.String?, `recurrenceRule`: kotlin.String?, `recurrenceReminderTime`: kotlin.String?, `reminder`: kotlin.String?, `kind`: kotlin.String, `expectedMinutes`: kotlin.Long?): TaskData {
+            return FfiConverterTypeTaskData.lift(
+    callWithHandle {
+    uniffiRustCallWithError(NionException) { _status ->
+    UniffiLib.uniffi_nion_core_fn_method_nioncore_create_task_ex(
+        it,
+        FfiConverterString.lower(`name`),FfiConverterOptionalString.lower(`description`),FfiConverterString.lower(`priority`),FfiConverterOptionalString.lower(`categoryId`),FfiConverterOptionalString.lower(`parentId`),FfiConverterOptionalString.lower(`groupId`),FfiConverterOptionalString.lower(`recurrenceRule`),FfiConverterOptionalString.lower(`recurrenceReminderTime`),FfiConverterOptionalString.lower(`reminder`),FfiConverterString.lower(`kind`),FfiConverterOptionalLong.lower(`expectedMinutes`),_status)
 }
     }
     )
@@ -2350,6 +2443,16 @@ open class NionCore: Disposable, AutoCloseable, NionCoreInterface
     
 
     
+    /**
+     * 删除实体，并把它的**直接子项上移一级**（挂到被删实体的父级），
+     * 同时清理双向关联里指向它的悬空 ID。
+     *
+     * 为什么不是级联删除：用户在确认框里看到的是「只删除当前项，N 个子项将上移一级」，
+     * 语义必须与文案一致。旧实现只删当前行，子项 `parent_id` 会指向已不存在的记录，
+     * 树形列表里这些子项直接消失但数据仍在（悬空行）。
+     *
+     * 全部操作在一个事务内：删除、子项改挂、关联清理要么都成功要么都不发生。
+     */
     @Throws(NionException::class)override fun `deleteTask`(`id`: kotlin.String): kotlin.Boolean {
             return FfiConverterBoolean.lift(
     callWithHandle {
@@ -2925,17 +3028,25 @@ open class NionCore: Disposable, AutoCloseable, NionCoreInterface
 
     
     /**
-     * 全文搜索笔记：匹配笔记的标题（name）和正文（description）。
-     * 可选指定 checklist_id 限定搜索范围；None 时搜索所有笔记型清单。
-     * query 不区分大小写，使用 SQL LIKE 模糊匹配。
+     * 笔记搜索 / 枚举。
+     *
+     * 语义（B1 起统一为「实体 kind 驱动」）：
+     * - `query = Some(q)`：按标题(name)与正文(description)做不区分大小写的 LIKE 模糊匹配；
+     * - `query = None`：不按关键词过滤，直接枚举笔记（`checklist_id` 给定时限定该清单，
+     * 未给定时跨全部清单枚举）——供 AI 工具「先看看有什么笔记」使用；
+     * - `include_children = false`：保持文档式搜索语义，只返回根节点（`parent_id IS NULL`）；
+     * `true` 时把子笔记也纳入结果 —— AI 工具需要完整视图，UI 搜索保持原语义。
+     *
+     * 只返回 `kind = 'note'` 的实体：任务型清单里手动建的任务不会混进笔记搜索。
+     * 返回按 `updated_at DESC` 排序（枚举时同样如此，最近的笔记在前）。
      */
-    @Throws(NionException::class)override fun `searchNotes`(`query`: kotlin.String, `checklistId`: kotlin.String?): List<TaskData> {
+    @Throws(NionException::class)override fun `searchNotes`(`query`: kotlin.String?, `checklistId`: kotlin.String?, `includeChildren`: kotlin.Boolean): List<TaskData> {
             return FfiConverterSequenceTypeTaskData.lift(
     callWithHandle {
     uniffiRustCallWithError(NionException) { _status ->
     UniffiLib.uniffi_nion_core_fn_method_nioncore_search_notes(
         it,
-        FfiConverterString.lower(`query`),FfiConverterOptionalString.lower(`checklistId`),_status)
+        FfiConverterOptionalString.lower(`query`),FfiConverterOptionalString.lower(`checklistId`),FfiConverterBoolean.lower(`includeChildren`),_status)
 }
     }
     )
@@ -3091,6 +3202,37 @@ open class NionCore: Disposable, AutoCloseable, NionCoreInterface
     UniffiLib.uniffi_nion_core_fn_method_nioncore_update_task(
         it,
         FfiConverterString.lower(`id`),FfiConverterOptionalString.lower(`name`),FfiConverterOptionalString.lower(`description`),FfiConverterOptionalString.lower(`priority`),FfiConverterOptionalString.lower(`status`),FfiConverterOptionalString.lower(`categoryId`),FfiConverterOptionalString.lower(`reminder`),FfiConverterOptionalString.lower(`groupId`),FfiConverterOptionalString.lower(`recurrenceRule`),FfiConverterOptionalString.lower(`recurrenceReminderTime`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 组合更新：字段 + 归属在一次事务内提交（B1 的工具诚实化基础）。
+     *
+     * 为什么需要它：历史上归属变更（parent / group / checklist）走各自的独立接口
+     * 各自自动提交，字段更新走 `update_task`，组合操作既没有事务，还会在「只改归属」
+     * 时被 `update_task` 的 `No fields to update` 守卫打成假失败 —— 数据其实已经写进去了，
+     * 工具却回报错误，模型据此自圆其说。
+     *
+     * 事务内顺序：先做环校验（沿 parent 链上溯，拒绝自环与 A→B→A），再写全部字段，
+     * 最后级联子孙归属；任一步失败整体回滚，不会留下写了一半的实体。
+     *
+     * UniFFI 约束：不支持嵌套 Option，因此「未提供 / 显式置空」用标志位区分。
+     * - `set_group = true` 时应用 `group_id`（None 表示清除分组）
+     * - `set_parent = true` 时应用 `parent_id`（None 表示提升为根）
+     * - `clear_expected_minutes = true` 时清除预计时长（7.9 要求可清除）
+     * - `clear_reminder = true` 时清除一次性提醒
+     */
+    @Throws(NionException::class)override fun `updateTaskFull`(`id`: kotlin.String, `name`: kotlin.String?, `description`: kotlin.String?, `priority`: kotlin.String?, `status`: kotlin.String?, `kind`: kotlin.String?, `expectedMinutes`: kotlin.Long?, `clearExpectedMinutes`: kotlin.Boolean, `categoryId`: kotlin.String?, `setGroup`: kotlin.Boolean, `groupId`: kotlin.String?, `setParent`: kotlin.Boolean, `parentId`: kotlin.String?, `reminder`: kotlin.String?, `clearReminder`: kotlin.Boolean, `recurrenceRule`: kotlin.String?, `recurrenceReminderTime`: kotlin.String?): TaskData {
+            return FfiConverterTypeTaskData.lift(
+    callWithHandle {
+    uniffiRustCallWithError(NionException) { _status ->
+    UniffiLib.uniffi_nion_core_fn_method_nioncore_update_task_full(
+        it,
+        FfiConverterString.lower(`id`),FfiConverterOptionalString.lower(`name`),FfiConverterOptionalString.lower(`description`),FfiConverterOptionalString.lower(`priority`),FfiConverterOptionalString.lower(`status`),FfiConverterOptionalString.lower(`kind`),FfiConverterOptionalLong.lower(`expectedMinutes`),FfiConverterBoolean.lower(`clearExpectedMinutes`),FfiConverterOptionalString.lower(`categoryId`),FfiConverterBoolean.lower(`setGroup`),FfiConverterOptionalString.lower(`groupId`),FfiConverterBoolean.lower(`setParent`),FfiConverterOptionalString.lower(`parentId`),FfiConverterOptionalString.lower(`reminder`),FfiConverterBoolean.lower(`clearReminder`),FfiConverterOptionalString.lower(`recurrenceRule`),FfiConverterOptionalString.lower(`recurrenceReminderTime`),_status)
 }
     }
     )
@@ -3950,6 +4092,15 @@ public object FfiConverterTypeStickerData: FfiConverterRustBuffer<StickerData> {
 
 
 
+/**
+ * 统一实体数据 —— 任务与笔记是同一种实体的两种 kind。
+ *
+ * 类型（kind）是实体自身的属性，不再由所在清单推导：
+ * - `kind = "task"`：可勾选，status / completed_at 语义完整；
+ * - `kind = "note"`：无勾选语义，status 字段物理保留但不参与 UI 判断。
+ *
+ * 清单的 checklist_type 只决定「新建时的默认 kind」与视图语境，不再决定已有实体的渲染方式。
+ */
 data class TaskData (
     var `id`: kotlin.String
     , 
@@ -3993,6 +4144,18 @@ data class TaskData (
      * 任务的 linked_task_ids 存储关联的笔记 ID。None 表示无关联。
      */
     var `linkedTaskIds`: kotlin.String?
+    , 
+    /**
+     * 实体类型："task"（可勾选）或 "note"（笔记，无勾选语义）
+     */
+    var `kind`: kotlin.String
+    , 
+    /**
+     * 预计总工作量（分钟）。NULL = 未规划时长。
+     * 这是「预计投入」而非结束时间：时间占用由 reminder（起点）+ 本字段派生，
+     * 不新增独立的结束时间字段。
+     */
+    var `expectedMinutes`: kotlin.Long?
     
 ){
     
@@ -4025,6 +4188,8 @@ public object FfiConverterTypeTaskData: FfiConverterRustBuffer<TaskData> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalLong.read(buf),
         )
     }
 
@@ -4044,7 +4209,9 @@ public object FfiConverterTypeTaskData: FfiConverterRustBuffer<TaskData> {
             FfiConverterLong.allocationSize(value.`focusSeconds`) +
             FfiConverterOptionalString.allocationSize(value.`recurrenceRule`) +
             FfiConverterOptionalString.allocationSize(value.`recurrenceReminderTime`) +
-            FfiConverterOptionalString.allocationSize(value.`linkedTaskIds`)
+            FfiConverterOptionalString.allocationSize(value.`linkedTaskIds`) +
+            FfiConverterString.allocationSize(value.`kind`) +
+            FfiConverterOptionalLong.allocationSize(value.`expectedMinutes`)
     )
 
     override fun write(value: TaskData, buf: ByteBuffer) {
@@ -4064,6 +4231,8 @@ public object FfiConverterTypeTaskData: FfiConverterRustBuffer<TaskData> {
             FfiConverterOptionalString.write(value.`recurrenceRule`, buf)
             FfiConverterOptionalString.write(value.`recurrenceReminderTime`, buf)
             FfiConverterOptionalString.write(value.`linkedTaskIds`, buf)
+            FfiConverterString.write(value.`kind`, buf)
+            FfiConverterOptionalLong.write(value.`expectedMinutes`, buf)
     }
 }
 
@@ -4215,6 +4384,38 @@ public object FfiConverterTypeNionError : FfiConverterRustBuffer<NionException> 
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalLong: FfiConverterRustBuffer<kotlin.Long?> {
+    override fun read(buf: ByteBuffer): kotlin.Long? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterLong.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.Long?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterLong.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.Long?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterLong.write(value, buf)
+        }
+    }
 }
 
 

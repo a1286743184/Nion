@@ -4,6 +4,20 @@ use rusqlite::params;
 
 use crate::models::*;
 
+/// tasks 表所有对外字段的列清单 —— 单一真源。
+///
+/// 用宏而不是常量：宏展开后仍是编译期字面量拼接，SQL 字符串零运行时开销。
+/// 新增列时只改这一处，避免多个查询各自漂移
+/// （历史上加字段时漏改某处 SELECT 是 map_task_row 取值错位的常见原因）。
+/// 列顺序必须与 `map_task_row` 的取值顺序严格一致。
+macro_rules! task_cols {
+    () => {
+        "id, name, description, priority, status, reminder, parent_id, category_id, group_id, \
+         created_at, updated_at, completed_at, focus_seconds, recurrence_rule, \
+         recurrence_reminder_time, linked_task_ids, kind, expected_minutes"
+    };
+}
+
 /// 查询指定表中的最大数字 ID，返回 +1 的字符串形式。
 /// 旧 UUID 记录经 CAST(id AS INTEGER) 结果为 0，不会干扰新 ID 计数。
 /// 必须在 Mutex 锁内调用以保证线程安全。
@@ -59,7 +73,9 @@ impl NionCore {
                 focus_seconds INTEGER NOT NULL DEFAULT 0,
                 recurrence_rule TEXT,
                 recurrence_reminder_time TEXT,
-                linked_task_ids TEXT
+                linked_task_ids TEXT,
+                kind TEXT NOT NULL DEFAULT 'task',
+                expected_minutes INTEGER
             );
             CREATE TABLE IF NOT EXISTS task_groups (
                 id TEXT PRIMARY KEY,
@@ -146,6 +162,34 @@ impl NionCore {
         conn.execute_batch("ALTER TABLE checklists ADD COLUMN checklist_type TEXT NOT NULL DEFAULT 'task'").ok();
         // 笔记-任务双向关联：给 tasks 表添加 linked_task_ids 列（逗号分隔的 ID）
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN linked_task_ids TEXT").ok();
+        // 实体类型：kind = 'task'（可勾选）或 'note'（笔记）。
+        // 类型从「清单推导」迁移为「实体自带属性」：清单的 checklist_type 从此只决定
+        // 新建默认值与视图语境，不再决定已有实体的渲染与勾选语义。
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'").ok();
+        // 预计总工作量（分钟）。NULL = 未规划时长；与 reminder（起点）组合派生时间占用，
+        // 不新增独立的结束时间字段。
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN expected_minutes INTEGER").ok();
+
+        // 存量刷写（仅在 kind 列首次出现时执行一次）：
+        // 把历史上位于笔记型清单中的实体标记为 note，保持升级前后外观一致。
+        // 通过 settings 里的迁移标记保证幂等 —— 用户之后手动把某条笔记转成任务，
+        // 不会因为每次启动都刷写而被改回去。
+        {
+            let marker = "migration_kind_backfill_done";
+            let done: Option<String> = conn
+                .query_row("SELECT value FROM settings WHERE key = ?1", params![marker], |row| row.get(0))
+                .ok();
+            if done.is_none() {
+                conn.execute_batch(
+                    "UPDATE tasks SET kind = 'note' WHERE category_id IN \
+                     (SELECT id FROM checklists WHERE checklist_type = 'notebook')",
+                ).ok();
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
+                    params![marker],
+                ).ok();
+            }
+        }
 
         // 每日任务实例化迁移：将旧模板（recurrence_rule='daily' 且 reminder IS NULL）
         // 的 reminder 锚定为今天的日期，使其成为当天的实例
@@ -176,7 +220,7 @@ impl NionCore {
         })?;
         let mut stmt = db
             .prepare(
-                "SELECT id, name, description, priority, status, reminder, parent_id, category_id, group_id, created_at, updated_at, completed_at, focus_seconds, recurrence_rule, recurrence_reminder_time, linked_task_ids FROM tasks ORDER BY sort_order ASC, created_at DESC"
+                concat!("SELECT ", task_cols!(), " FROM tasks ORDER BY sort_order ASC, created_at DESC")
             )
             .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
 
@@ -318,7 +362,7 @@ impl NionCore {
         }
 
         let sql = format!(
-            "SELECT id, name, description, priority, status, reminder, parent_id, category_id, group_id, created_at, updated_at, completed_at, focus_seconds, recurrence_rule, recurrence_reminder_time, linked_task_ids FROM tasks WHERE {} ORDER BY sort_order ASC, created_at DESC",
+            concat!("SELECT ", task_cols!(), " FROM tasks WHERE {} ORDER BY sort_order ASC, created_at DESC"),
             conditions.join(" AND ")
         );
         let mut stmt = db.prepare(&sql).map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
@@ -350,7 +394,7 @@ impl NionCore {
         // 不再查 daily_completions 表，每日任务的完成状态由 tasks.status 决定。
         // 第三个 OR 分支把"过期未完成"的每日实例也并入今日列表，
         // 让 UI 统一渲染（reminder 日期 < 今天时自动标红），完成后即从结果中消失。
-        let sql = "SELECT id, name, description, priority, status, reminder, parent_id, category_id, group_id, created_at, updated_at, completed_at, focus_seconds, recurrence_rule, recurrence_reminder_time, linked_task_ids FROM tasks WHERE parent_id IS NULL AND (SUBSTR(reminder, 1, 10) = ?1 OR (recurrence_rule = 'daily' AND reminder IS NULL) OR (recurrence_rule = 'daily' AND status = 'todo' AND SUBSTR(reminder, 1, 10) < ?1)) ORDER BY COALESCE(SUBSTR(reminder, 12, 5), recurrence_reminder_time, '99:99') ASC, sort_order ASC, created_at DESC";
+        let sql = concat!("SELECT ", task_cols!(), " FROM tasks WHERE parent_id IS NULL AND (SUBSTR(reminder, 1, 10) = ?1 OR (recurrence_rule = 'daily' AND reminder IS NULL) OR (recurrence_rule = 'daily' AND status = 'todo' AND SUBSTR(reminder, 1, 10) < ?1)) ORDER BY COALESCE(SUBSTR(reminder, 12, 5), recurrence_reminder_time, '99:99') ASC, sort_order ASC, created_at DESC");
         let mut stmt = db.prepare(sql)
             .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
 
@@ -382,7 +426,7 @@ impl NionCore {
         })?;
         let mut stmt = db
             .prepare(
-                "SELECT id, name, description, priority, status, reminder, parent_id, category_id, group_id, created_at, updated_at, completed_at, focus_seconds, recurrence_rule, recurrence_reminder_time, linked_task_ids FROM tasks WHERE parent_id = ?1 ORDER BY sort_order ASC, created_at ASC"
+                concat!("SELECT ", task_cols!(), " FROM tasks WHERE parent_id = ?1 ORDER BY sort_order ASC, created_at ASC")
             )
             .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
         let rows = stmt
@@ -395,6 +439,11 @@ impl NionCore {
         Ok(tasks)
     }
 
+    /// 创建实体（默认 kind = "task"）。
+    ///
+    /// 保留这个签名是为了让既有的 UI 路径与测试不必逐个改参数；
+    /// 需要显式指定 kind / expected_minutes 的调用方（AI 工具层、笔记编辑器、
+    /// 预计时长表单）使用 [`create_task_ex`]。
     pub fn create_task(
         &self,
         name: String,
@@ -407,11 +456,49 @@ impl NionCore {
         recurrence_reminder_time: Option<String>,
         reminder: Option<String>,
     ) -> Result<TaskData, NionError> {
+        self.create_task_ex(
+            name,
+            description,
+            priority,
+            category_id,
+            parent_id,
+            group_id,
+            recurrence_rule,
+            recurrence_reminder_time,
+            reminder,
+            "task".to_string(),
+            None,
+        )
+    }
+
+    /// 创建实体，可显式指定 kind 与预计时长（B3 起的主入口）。
+    ///
+    /// @param kind             "task"（可勾选）或 "note"（笔记）；其他值按 "task" 处理
+    /// @param expected_minutes 预计总工作量（分钟），None = 未规划
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_task_ex(
+        &self,
+        name: String,
+        description: Option<String>,
+        priority: String,
+        category_id: Option<String>,
+        parent_id: Option<String>,
+        group_id: Option<String>,
+        recurrence_rule: Option<String>,
+        recurrence_reminder_time: Option<String>,
+        reminder: Option<String>,
+        kind: String,
+        expected_minutes: Option<i64>,
+    ) -> Result<TaskData, NionError> {
         let db = self.db.lock().map_err(|e| NionError::DatabaseError {
             msg: e.to_string(),
         })?;
         let id = next_id(&db, "tasks")?;
         let now = chrono::Utc::now().to_rfc3339();
+        // 非法 kind 归一到 task，避免脏值泄漏到 UI 的渲染分支
+        let kind = normalize_kind(&kind);
+        // 预计时长只接受正数；0 与负数视为未规划，防止下游做除法或进度条时踩 0
+        let expected_minutes = expected_minutes.filter(|m| *m > 0);
 
         // 计算 reminder：优先使用调用方传入的 reminder，否则为每日任务自动生成
         let final_reminder = reminder.or_else(|| {
@@ -427,8 +514,8 @@ impl NionCore {
         });
 
         db.execute(
-            "INSERT INTO tasks (id, name, description, priority, status, category_id, parent_id, group_id, reminder, recurrence_rule, recurrence_reminder_time, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'todo', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![id, name, description, priority, category_id, parent_id, group_id, final_reminder, recurrence_rule, recurrence_reminder_time, now, now],
+            "INSERT INTO tasks (id, name, description, priority, status, category_id, parent_id, group_id, reminder, recurrence_rule, recurrence_reminder_time, created_at, updated_at, kind, expected_minutes) VALUES (?1, ?2, ?3, ?4, 'todo', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![id, name, description, priority, category_id, parent_id, group_id, final_reminder, recurrence_rule, recurrence_reminder_time, now, now, kind, expected_minutes],
         )
         .map_err(|e| NionError::DatabaseError {
             msg: e.to_string(),
@@ -451,6 +538,8 @@ impl NionCore {
             recurrence_rule,
             recurrence_reminder_time,
             linked_task_ids: None,
+            kind,
+            expected_minutes,
         })
     }
 
@@ -550,11 +639,199 @@ impl NionCore {
         query_task(&db, &id)
     }
 
-    pub fn delete_task(&self, id: String) -> Result<bool, NionError> {
-        let db = self.db.lock().map_err(|e| NionError::DatabaseError {
+    /// 组合更新：字段 + 归属在一次事务内提交（B1 的工具诚实化基础）。
+    ///
+    /// 为什么需要它：历史上归属变更（parent / group / checklist）走各自的独立接口
+    /// 各自自动提交，字段更新走 `update_task`，组合操作既没有事务，还会在「只改归属」
+    /// 时被 `update_task` 的 `No fields to update` 守卫打成假失败 —— 数据其实已经写进去了，
+    /// 工具却回报错误，模型据此自圆其说。
+    ///
+    /// 事务内顺序：先做环校验（沿 parent 链上溯，拒绝自环与 A→B→A），再写全部字段，
+    /// 最后级联子孙归属；任一步失败整体回滚，不会留下写了一半的实体。
+    ///
+    /// UniFFI 约束：不支持嵌套 Option，因此「未提供 / 显式置空」用标志位区分。
+    /// - `set_group = true` 时应用 `group_id`（None 表示清除分组）
+    /// - `set_parent = true` 时应用 `parent_id`（None 表示提升为根）
+    /// - `clear_expected_minutes = true` 时清除预计时长（7.9 要求可清除）
+    /// - `clear_reminder = true` 时清除一次性提醒
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_task_full(
+        &self,
+        id: String,
+        name: Option<String>,
+        description: Option<String>,
+        priority: Option<String>,
+        status: Option<String>,
+        kind: Option<String>,
+        expected_minutes: Option<i64>,
+        clear_expected_minutes: bool,
+        category_id: Option<String>,
+        set_group: bool,
+        group_id: Option<String>,
+        set_parent: bool,
+        parent_id: Option<String>,
+        reminder: Option<String>,
+        clear_reminder: bool,
+        recurrence_rule: Option<String>,
+        recurrence_reminder_time: Option<String>,
+    ) -> Result<TaskData, NionError> {
+        let mut db = self.db.lock().map_err(|e| NionError::DatabaseError {
             msg: e.to_string(),
         })?;
-        // 先查询关联的附件文件路径，删除任务后清理磁盘文件
+
+        // 先做一次存在性校验：不存在时应在写事务开始前就返回 NotFound，
+        // 避免事务里 UPDATE 影响 0 行却被当成成功
+        let exists: bool = db
+            .query_row("SELECT 1 FROM tasks WHERE id = ?1", params![id], |_| Ok(true))
+            .unwrap_or(false);
+        if !exists {
+            return Err(NionError::NotFound {
+                msg: format!("任务不存在: {}", id),
+            });
+        }
+
+        // 环校验必须在事务之外先做（读操作即可），校验不过就不开事务
+        if set_parent {
+            validate_parent_assignment(&db, &id, parent_id.as_deref())?;
+        }
+
+        // 事务包裹全部写入：Transaction 在 Drop 时自动回滚，
+        // 因此任何错误分支只需直接返回，不需要手工 ROLLBACK
+        let tx = db.transaction().map_err(|e| NionError::DatabaseError {
+            msg: e.to_string(),
+        })?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut sets: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        // 局部宏：把「列名 + 值」压入 SET 列表，统一维护占位符编号
+        macro_rules! push_set {
+            ($col:expr, $val:expr) => {{
+                let idx = param_values.len() + 1;
+                sets.push(format!("{} = ?{}", $col, idx));
+                param_values.push($val);
+            }};
+        }
+
+        if let Some(ref v) = name {
+            push_set!("name", Box::new(v.clone()) as Box<dyn rusqlite::types::ToSql>);
+        }
+        if let Some(ref v) = description {
+            push_set!("description", Box::new(v.clone()) as Box<dyn rusqlite::types::ToSql>);
+        }
+        if let Some(ref v) = priority {
+            push_set!("priority", Box::new(v.clone()) as Box<dyn rusqlite::types::ToSql>);
+        }
+        if let Some(ref v) = status {
+            push_set!("status", Box::new(v.clone()) as Box<dyn rusqlite::types::ToSql>);
+            // 完成态与 completed_at 必须同步：标 back 到 todo 时保留原 completed_at
+            // （7.2 要求 task→note→task 转换后能恢复完成状态显示）
+            if v == "done" {
+                push_set!("completed_at", Box::new(now.clone()) as Box<dyn rusqlite::types::ToSql>);
+            }
+        }
+        if let Some(ref v) = kind {
+            push_set!("kind", Box::new(normalize_kind(v)) as Box<dyn rusqlite::types::ToSql>);
+        }
+        // expected_minutes：显式清除优先于赋值
+        if clear_expected_minutes {
+            sets.push("expected_minutes = NULL".to_string());
+        } else if let Some(v) = expected_minutes {
+            // 只接受正数，0/负数按无效值忽略（与 create_task_ex 一致）
+            if v > 0 {
+                push_set!("expected_minutes", Box::new(v) as Box<dyn rusqlite::types::ToSql>);
+            }
+        }
+        if let Some(ref v) = category_id {
+            push_set!("category_id", Box::new(v.clone()) as Box<dyn rusqlite::types::ToSql>);
+        }
+        if set_group {
+            match group_id {
+                Some(ref g) => push_set!("group_id", Box::new(g.clone()) as Box<dyn rusqlite::types::ToSql>),
+                None => sets.push("group_id = NULL".to_string()),
+            }
+        }
+        // 改 parent：挂到新父级时继承父级归属（与 update_task_parent 语义一致）；
+        // 提升为根时保留当前归属（不清清单/分组，只断开父子关系）
+        if set_parent {
+            match parent_id {
+                Some(ref p) => {
+                    let (parent_cat, parent_grp): (Option<String>, Option<String>) = tx
+                        .query_row(
+                            "SELECT category_id, group_id FROM tasks WHERE id = ?1",
+                            params![p],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|e| NionError::NotFound {
+                            msg: format!("父任务不存在: {} ({})", p, e),
+                        })?;
+                    push_set!("parent_id", Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>);
+                    // 父级归属覆盖显式传入的 category_id：父子不同清单会让树形 UI 撕裂
+                    push_set!("category_id", Box::new(parent_cat) as Box<dyn rusqlite::types::ToSql>);
+                    push_set!("group_id", Box::new(parent_grp) as Box<dyn rusqlite::types::ToSql>);
+                }
+                None => sets.push("parent_id = NULL".to_string()),
+            }
+        }
+        if clear_reminder {
+            sets.push("reminder = NULL".to_string());
+        } else if let Some(ref v) = reminder {
+            push_set!("reminder", Box::new(v.clone()) as Box<dyn rusqlite::types::ToSql>);
+        }
+        if let Some(ref v) = recurrence_rule {
+            push_set!("recurrence_rule", Box::new(v.clone()) as Box<dyn rusqlite::types::ToSql>);
+        }
+        if let Some(ref v) = recurrence_reminder_time {
+            push_set!("recurrence_reminder_time", Box::new(v.clone()) as Box<dyn rusqlite::types::ToSql>);
+        }
+
+        // 没有任何实际变更时直接返回当前实体（幂等：目标状态已达成视为成功），
+        // 而不是像 update_task 那样报 No fields to update
+        if sets.is_empty() {
+            let task = query_task(&tx, &id)?;
+            tx.commit().map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
+            return Ok(task);
+        }
+
+        push_set!("updated_at", Box::new(now) as Box<dyn rusqlite::types::ToSql>);
+        let sql = format!(
+            "UPDATE tasks SET {} WHERE id = ?{}",
+            sets.join(", "),
+            param_values.len() + 1
+        );
+        param_values.push(Box::new(id.clone()));
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        tx.execute(&sql, param_refs.as_slice())
+            .map_err(|e| NionError::DatabaseError {
+                msg: e.to_string(),
+            })?;
+
+        // 归属变化后必须级联子孙，否则出现「父项在新清单、子项留在旧清单」
+        if category_id.is_some() || set_group || set_parent {
+            cascade_to_descendants(&tx, &id)?;
+        }
+
+        let task = query_task(&tx, &id)?;
+        tx.commit().map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
+        Ok(task)
+    }
+
+    /// 删除实体，并把它的**直接子项上移一级**（挂到被删实体的父级），
+    /// 同时清理双向关联里指向它的悬空 ID。
+    ///
+    /// 为什么不是级联删除：用户在确认框里看到的是「只删除当前项，N 个子项将上移一级」，
+    /// 语义必须与文案一致。旧实现只删当前行，子项 `parent_id` 会指向已不存在的记录，
+    /// 树形列表里这些子项直接消失但数据仍在（悬空行）。
+    ///
+    /// 全部操作在一个事务内：删除、子项改挂、关联清理要么都成功要么都不发生。
+    pub fn delete_task(&self, id: String) -> Result<bool, NionError> {
+        let mut db = self.db.lock().map_err(|e| NionError::DatabaseError {
+            msg: e.to_string(),
+        })?;
+
+        // 先查附件路径（事务外只读，事务提交后再删磁盘文件 —— 磁盘 IO 不该占着写锁）
         let attachment_paths: Vec<String> = {
             let mut stmt = db
                 .prepare("SELECT file_path FROM attachments WHERE task_id = ?1")
@@ -564,15 +841,42 @@ impl NionCore {
                 .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
             rows.filter_map(|r| r.ok()).collect()
         };
-        // 删除关联的专注会话记录
-        db.execute("DELETE FROM focus_sessions WHERE task_id = ?1", params![id]).ok();
-        // 删除任务（attachments 通过 ON DELETE CASCADE 自动清理）
-        let rows = db
+
+        // 读取被删实体的 parent，作为子项的新父级（None = 子项变成根实体）
+        let new_parent: Option<String> = db
+            .query_row("SELECT parent_id FROM tasks WHERE id = ?1", params![id], |row| row.get(0))
+            .map_err(|_| NionError::NotFound {
+                msg: format!("任务不存在: {}", id),
+            })?;
+
+        let tx = db.transaction().map_err(|e| NionError::DatabaseError {
+            msg: e.to_string(),
+        })?;
+
+        // 1) 直接子项上移一级（更深层级的 parent 不变，树形结构自然保持）
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE tasks SET parent_id = ?1, updated_at = ?2 WHERE parent_id = ?3",
+            params![new_parent, now, id],
+        )
+        .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
+
+        // 2) 清理其它实体里指向本实体的关联 ID。
+        //    linked_task_ids 是逗号分隔的裸文本，只能逐行读改写；
+        //    行数规模为「有关联的实体」，不会全表扫。
+        cleanup_links_to(&tx, &id)?;
+
+        // 3) 专注会话与实体本身（attachments 由 ON DELETE CASCADE 清理）
+        tx.execute("DELETE FROM focus_sessions WHERE task_id = ?1", params![id]).ok();
+        let rows = tx
             .execute("DELETE FROM tasks WHERE id = ?1", params![id])
             .map_err(|e| NionError::DatabaseError {
                 msg: e.to_string(),
             })?;
-        // 删除磁盘上的附件文件（数据库行已由 CASCADE 删除）
+
+        tx.commit().map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
+
+        // 事务已提交，磁盘附件删除失败不影响数据一致性
         for path in &attachment_paths {
             std::fs::remove_file(path).ok();
         }
@@ -1557,7 +1861,7 @@ impl NionCore {
         })?;
 
         // 新模型：直接通过 reminder 日期匹配，完成状态看 tasks.status
-        let sql = "SELECT id, name, description, priority, status, reminder, parent_id, category_id, group_id, created_at, updated_at, completed_at, focus_seconds, recurrence_rule, recurrence_reminder_time, linked_task_ids FROM tasks WHERE parent_id IS NULL AND (SUBSTR(reminder, 1, 10) = ?1 OR (recurrence_rule = 'daily' AND reminder IS NULL)) ORDER BY COALESCE(SUBSTR(reminder, 12, 5), recurrence_reminder_time, '99:99') ASC, sort_order ASC, created_at DESC";
+        let sql = concat!("SELECT ", task_cols!(), " FROM tasks WHERE parent_id IS NULL AND (SUBSTR(reminder, 1, 10) = ?1 OR (recurrence_rule = 'daily' AND reminder IS NULL)) ORDER BY COALESCE(SUBSTR(reminder, 12, 5), recurrence_reminder_time, '99:99') ASC, sort_order ASC, created_at DESC");
         let mut stmt = db.prepare(sql).map_err(|e| NionError::DatabaseError {
             msg: e.to_string(),
         })?;
@@ -1749,60 +2053,66 @@ impl NionCore {
 
     // ==================== 笔记搜索与任务关联 ====================
 
-    /// 全文搜索笔记：匹配笔记的标题（name）和正文（description）。
-    /// 可选指定 checklist_id 限定搜索范围；None 时搜索所有笔记型清单。
-    /// query 不区分大小写，使用 SQL LIKE 模糊匹配。
+    /// 笔记搜索 / 枚举。
+    ///
+    /// 语义（B1 起统一为「实体 kind 驱动」）：
+    /// - `query = Some(q)`：按标题(name)与正文(description)做不区分大小写的 LIKE 模糊匹配；
+    /// - `query = None`：不按关键词过滤，直接枚举笔记（`checklist_id` 给定时限定该清单，
+    ///   未给定时跨全部清单枚举）——供 AI 工具「先看看有什么笔记」使用；
+    /// - `include_children = false`：保持文档式搜索语义，只返回根节点（`parent_id IS NULL`）；
+    ///   `true` 时把子笔记也纳入结果 —— AI 工具需要完整视图，UI 搜索保持原语义。
+    ///
+    /// 只返回 `kind = 'note'` 的实体：任务型清单里手动建的任务不会混进笔记搜索。
+    /// 返回按 `updated_at DESC` 排序（枚举时同样如此，最近的笔记在前）。
     pub fn search_notes(
         &self,
-        query: String,
+        query: Option<String>,
         checklist_id: Option<String>,
+        include_children: bool,
     ) -> Result<Vec<TaskData>, NionError> {
         let db = self.db.lock().map_err(|e| NionError::DatabaseError {
             msg: e.to_string(),
         })?;
 
-        // 构造 LIKE 模式：在查询词前后加 % 实现模糊匹配
-        let like_pattern = format!("%{}%", query);
+        // 动态拼接 WHERE：条件数量取决于入参与是否包含子项，参数按出现顺序编号
+        let mut conditions: Vec<String> = vec!["kind = 'note'".to_string()];
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        if let Some(ref cid) = checklist_id {
-            // 限定在指定清单内搜索
-            let mut stmt = db
-                .prepare(
-                    "SELECT id, name, description, priority, status, reminder, parent_id, category_id, group_id, created_at, updated_at, completed_at, focus_seconds, recurrence_rule, recurrence_reminder_time, linked_task_ids \
-                     FROM tasks WHERE category_id = ?1 AND parent_id IS NULL \
-                     AND (name LIKE ?2 OR description LIKE ?2) \
-                     ORDER BY updated_at DESC"
-                )
-                .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
-            let rows = stmt
-                .query_map(params![cid, like_pattern], |row| map_task_row(row))
-                .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
-            let mut result = Vec::new();
-            for row in rows {
-                result.push(row.map_err(|e| NionError::DatabaseError { msg: e.to_string() })?);
-            }
-            Ok(result)
-        } else {
-            // 搜索所有笔记型清单下的笔记：通过 JOIN checklists 筛选 checklist_type='notebook'
-            let mut stmt = db
-                .prepare(
-                    "SELECT t.id, t.name, t.description, t.priority, t.status, t.reminder, t.parent_id, t.category_id, t.group_id, t.created_at, t.updated_at, t.completed_at, t.focus_seconds, t.recurrence_rule, t.recurrence_reminder_time, t.linked_task_ids \
-                     FROM tasks t \
-                     INNER JOIN checklists c ON t.category_id = c.id \
-                     WHERE c.checklist_type = 'notebook' AND t.parent_id IS NULL \
-                     AND (t.name LIKE ?1 OR t.description LIKE ?1) \
-                     ORDER BY t.updated_at DESC"
-                )
-                .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
-            let rows = stmt
-                .query_map(params![like_pattern], |row| map_task_row(row))
-                .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
-            let mut result = Vec::new();
-            for row in rows {
-                result.push(row.map_err(|e| NionError::DatabaseError { msg: e.to_string() })?);
-            }
-            Ok(result)
+        if !include_children {
+            conditions.push("parent_id IS NULL".to_string());
         }
+        if let Some(ref cid) = checklist_id {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("category_id = ?{idx}"));
+            param_values.push(Box::new(cid.clone()));
+        }
+        // 关键词：同时匹配标题与正文；空字符串视作未提供（避免 "%%" 匹配全部）
+        if let Some(ref q) = query {
+            if !q.trim().is_empty() {
+                let idx = param_values.len() + 1;
+                conditions.push(format!("(name LIKE ?{idx} OR description LIKE ?{idx})"));
+                param_values.push(Box::new(format!("%{}%", q)));
+            }
+        }
+
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE {} ORDER BY updated_at DESC",
+            task_cols!(),
+            conditions.join(" AND ")
+        );
+        let mut stmt = db
+            .prepare(&sql)
+            .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| map_task_row(row))
+            .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(|e| NionError::DatabaseError { msg: e.to_string() })?);
+        }
+        Ok(result)
     }
 
     /// 建立笔记与任务的双向关联。
@@ -2250,6 +2560,99 @@ fn cascade_to_descendants(
     Ok(())
 }
 
+/// 实体 kind 归一：只接受 "task" / "note"，其余值（含空串、大小写变体）一律按 "task"。
+/// 归一放在写入层，避免脏值进入 UI 的渲染分支或工具返回值。
+fn normalize_kind(kind: &str) -> String {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "note" => "note".to_string(),
+        _ => "task".to_string(),
+    }
+}
+
+/// 环校验：拒绝「自己挂自己」以及「把祖先挂到自己的子孙下面」。
+///
+/// 沿目标父级的 parent 链一直上溯，只要途中遇到自己就说明会成环。
+/// 链长度天然受树深度约束；额外加一个上限防御脏数据里已存在的环（否则会死循环）。
+fn validate_parent_assignment(
+    db: &rusqlite::Connection,
+    task_id: &str,
+    new_parent_id: Option<&str>,
+) -> Result<(), NionError> {
+    let Some(mut cursor) = new_parent_id.map(|s| s.to_string()) else {
+        return Ok(()); // 提升为根，不可能成环
+    };
+    if cursor == task_id {
+        return Err(NionError::ValidationError {
+            msg: "不能把实体挂到它自己下面".to_string(),
+        });
+    }
+    // 上限 256 层：正常树远达不到，超过即视为脏数据环，直接拒绝
+    for _ in 0..256 {
+        let next: Option<String> = db
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE id = ?1",
+                params![cursor],
+                |row| row.get(0),
+            )
+            .map_err(|e| NionError::NotFound {
+                msg: format!("目标父级不存在: {} ({})", cursor, e),
+            })?;
+        match next {
+            Some(p) => {
+                if p == task_id {
+                    return Err(NionError::ValidationError {
+                        msg: "不能把实体挂到它自己的子孙下面（会形成环）".to_string(),
+                    });
+                }
+                cursor = p;
+            }
+            None => return Ok(()),
+        }
+    }
+    Err(NionError::ValidationError {
+        msg: "父子链过长或已存在环，拒绝本次归属变更".to_string(),
+    })
+}
+
+/// 清理所有实体 `linked_task_ids` 中指向 `removed_id` 的引用。
+///
+/// 关联是双向裸文本存储（逗号分隔），删除一端时另一端必须同步剔除，
+/// 否则 UI 会显示「关联内容不存在」的失效条目。
+fn cleanup_links_to(db: &rusqlite::Connection, removed_id: &str) -> Result<(), NionError> {
+    // 只取含该 ID 的行：LIKE 作为粗筛，精确比对在内存里做
+    let mut stmt = db
+        .prepare(
+            "SELECT id, linked_task_ids FROM tasks \
+             WHERE linked_task_ids IS NOT NULL AND linked_task_ids != ''",
+        )
+        .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    for (row_id, links) in rows {
+        let kept: Vec<&str> = links
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != removed_id)
+            .collect();
+        // 未发生变化就跳过，避免无意义的 updated_at 抖动
+        if kept.len() == links.split(',').filter(|s| !s.trim().is_empty()).count() {
+            continue;
+        }
+        let new_links = if kept.is_empty() { None } else { Some(kept.join(",")) };
+        db.execute(
+            "UPDATE tasks SET linked_task_ids = ?1, updated_at = ?2 WHERE id = ?3",
+            params![new_links, now, row_id],
+        )
+        .map_err(|e| NionError::DatabaseError { msg: e.to_string() })?;
+    }
+    Ok(())
+}
+
 fn map_task_row(row: &rusqlite::Row) -> rusqlite::Result<TaskData> {
     Ok(TaskData {
         id: row.get(0)?,
@@ -2268,12 +2671,15 @@ fn map_task_row(row: &rusqlite::Row) -> rusqlite::Result<TaskData> {
         recurrence_rule: row.get(13)?,
         recurrence_reminder_time: row.get(14)?,
         linked_task_ids: row.get(15)?,
+        // kind / expected_minutes 追加在列清单末尾，索引必须与 task_cols!() 顺序一致
+        kind: row.get(16)?,
+        expected_minutes: row.get(17)?,
     })
 }
 
 fn query_task(db: &rusqlite::Connection, id: &str) -> Result<TaskData, NionError> {
     db.query_row(
-        "SELECT id, name, description, priority, status, reminder, parent_id, category_id, group_id, created_at, updated_at, completed_at, focus_seconds, recurrence_rule, recurrence_reminder_time, linked_task_ids FROM tasks WHERE id = ?1",
+        concat!("SELECT ", task_cols!(), " FROM tasks WHERE id = ?1"),
         params![id],
         |row| map_task_row(row),
     )
@@ -3155,32 +3561,35 @@ mod tests {
         // 创建笔记型清单
         let nb = core.create_checklist_with_type("读书笔记".to_string(), "notebook".to_string()).unwrap();
 
-        // 在笔记清单中创建几条笔记（用 task 模拟笔记条目）
-        let note1 = core.create_task(
+        // 用 create_task_ex 显式写 kind=note：B3 起笔记搜索按实体 kind 过滤，
+        // 不再靠「所在清单是 notebook 型」推导类型
+        let note1 = core.create_task_ex(
             "Rust 程序设计".to_string(),
             Some("# Rust 学习\n\n所有权和借用是 Rust 的核心".to_string()),
             "medium".to_string(),
             Some(nb.id.clone()), None, None, None, None, None,
+            "note".to_string(), None,
         ).unwrap();
-        let note2 = core.create_task(
+        let note2 = core.create_task_ex(
             "原子习惯".to_string(),
             Some("每天进步 1%，一年后就是 37 倍".to_string()),
             "medium".to_string(),
             Some(nb.id.clone()), None, None, None, None, None,
+            "note".to_string(), None,
         ).unwrap();
 
         // 搜索 "Rust" —— 应只匹配 note1
-        let results = core.search_notes("Rust".to_string(), Some(nb.id.clone())).unwrap();
+        let results = core.search_notes(Some("Rust".to_string()), Some(nb.id.clone()), false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Rust 程序设计");
 
         // 搜索 "习惯" —— 应只匹配 note2
-        let results = core.search_notes("习惯".to_string(), Some(nb.id.clone())).unwrap();
+        let results = core.search_notes(Some("习惯".to_string()), Some(nb.id.clone()), false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "原子习惯");
 
         // 全局搜索（不限定清单），应搜到笔记型清单下的所有匹配项
-        let results = core.search_notes("每天".to_string(), None).unwrap();
+        let results = core.search_notes(Some("每天".to_string()), None, false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "原子习惯");
     }
@@ -3315,5 +3724,267 @@ mod tests {
 
         // 不存在的歌单追加条目应报 NotFound
         assert!(core.add_track_to_local_playlist(9999, 1).is_err());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // B1 / B3：组合更新事务、环校验、kind 往返、子笔记搜索、删除上移
+    // ═══════════════════════════════════════════════════════════════
+
+    /// 组合更新：只改归属（parent）时不得报错，且字段与归属一起落库。
+    /// 这是「工具报错但已写入」假失败的根因回归。
+    #[test]
+    fn test_update_task_full_parent_only_no_false_failure() {
+        let core = make_in_memory();
+        let parent = core.create_task("父项".into(), None, "high".into(), None, None, None, None, None, None).unwrap();
+        let child = core.create_task("子项".into(), None, "low".into(), None, None, None, None, None, None).unwrap();
+
+        // 只传 set_parent，其余字段全为 None —— 必须成功而不是 No fields to update
+        let updated = core.update_task_full(
+            child.id.clone(),
+            None, None, None, None, None, None, false,
+            None, false, None, true, Some(parent.id.clone()),
+            None, false, None, None,
+        ).unwrap();
+        assert_eq!(updated.parent_id.as_deref(), Some(parent.id.as_str()));
+        // 回读校验：内存返回值与库内数据一致
+        assert_eq!(core.get_task(child.id.clone()).unwrap().parent_id.as_deref(), Some(parent.id.as_str()));
+    }
+
+    /// 组合更新：字段与归属一次提交；同样内容重复提交视为成功（幂等）。
+    #[test]
+    fn test_update_task_full_fields_and_ownership_idempotent() {
+        let core = make_in_memory();
+        let cl_a = core.create_checklist("A 清单".into()).unwrap();
+        let cl_b = core.create_checklist("B 清单".into()).unwrap();
+        let t = core.create_task("原名字".into(), None, "low".into(), Some(cl_a.id.clone()), None, None, None, None, None).unwrap();
+
+        let apply = || core.update_task_full(
+            t.id.clone(),
+            Some("新名字".into()), Some("新描述".into()), Some("high".into()), None, None, None, false,
+            Some(cl_b.id.clone()), false, None, false, None, None, false, None, None,
+        );
+
+        let first = apply().unwrap();
+        assert_eq!(first.name, "新名字");
+        assert_eq!(first.description.as_deref(), Some("新描述"));
+        assert_eq!(first.priority, "high");
+        assert_eq!(first.category_id.as_deref(), Some(cl_b.id.as_str()));
+
+        // 第二次相同调用：目标状态已达成，仍返回 success + 当前实体，不产生副作用
+        let second = apply().unwrap();
+        assert_eq!(second.name, "新名字");
+        assert_eq!(second.category_id.as_deref(), Some(cl_b.id.as_str()));
+    }
+
+    /// 环校验：拒绝自环与「挂到自己的子孙下面」，且失败时不得写入任何字段。
+    #[test]
+    fn test_update_task_full_rejects_cycles_atomically() {
+        let core = make_in_memory();
+        let a = core.create_task("A".into(), None, "medium".into(), None, None, None, None, None, None).unwrap();
+        let b = core.create_task("B".into(), None, "medium".into(), None, Some(a.id.clone()), None, None, None, None).unwrap();
+        let c = core.create_task("C".into(), None, "medium".into(), None, Some(b.id.clone()), None, None, None, None).unwrap();
+
+        // 自环
+        let err = core.update_task_full(
+            a.id.clone(), Some("改过的名字".into()), None, None, None, None, None, false,
+            None, false, None, true, Some(a.id.clone()), None, false, None, None,
+        ).unwrap_err();
+        assert!(matches!(err, NionError::ValidationError { .. }));
+
+        // A 挂到孙子 C 下面 → 环
+        let err = core.update_task_full(
+            a.id.clone(), Some("改过的名字".into()), None, None, None, None, None, false,
+            None, false, None, true, Some(c.id.clone()), None, false, None, None,
+        ).unwrap_err();
+        assert!(matches!(err, NionError::ValidationError { .. }));
+
+        // 失败必须整体不落库：名字没被改动，父子关系保持原样
+        let reloaded = core.get_task(a.id.clone()).unwrap();
+        assert_eq!(reloaded.name, "A");
+        assert_eq!(reloaded.parent_id, None);
+    }
+
+    /// 组合更新：仅归属变更也要级联子孙的清单/分组。
+    #[test]
+    fn test_update_task_full_cascades_descendants() {
+        let core = make_in_memory();
+        let cl_a = core.create_checklist("源清单".into()).unwrap();
+        let cl_b = core.create_checklist("目标清单".into()).unwrap();
+        let root = core.create_task("根".into(), None, "medium".into(), Some(cl_a.id.clone()), None, None, None, None, None).unwrap();
+        let child = core.create_task("子".into(), None, "medium".into(), Some(cl_a.id.clone()), Some(root.id.clone()), None, None, None, None).unwrap();
+
+        core.update_task_full(
+            root.id.clone(), None, None, None, None, None, None, false,
+            Some(cl_b.id.clone()), false, None, false, None, None, false, None, None,
+        ).unwrap();
+
+        assert_eq!(core.get_task(child.id.clone()).unwrap().category_id.as_deref(), Some(cl_b.id.as_str()));
+    }
+
+    /// kind / expected_minutes 往返：创建 → 回读 → 互转 → 清除时长。
+    #[test]
+    fn test_kind_and_expected_minutes_roundtrip() {
+        let core = make_in_memory();
+        let cl = core.create_checklist("清单".into()).unwrap();
+
+        // 笔记型实体带预计时长
+        let note = core.create_task_ex(
+            "一条笔记".into(), Some("正文".into()), "medium".into(),
+            Some(cl.id.clone()), None, None, None, None, None,
+            "note".into(), Some(45),
+        ).unwrap();
+        assert_eq!(note.kind, "note");
+        assert_eq!(note.expected_minutes, Some(45));
+
+        // 回读校验（走 SELECT 列清单 + map_task_row 映射）
+        let reloaded = core.get_task(note.id.clone()).unwrap();
+        assert_eq!(reloaded.kind, "note");
+        assert_eq!(reloaded.expected_minutes, Some(45));
+
+        // note → task：kind 翻转，其余跟随实体保留
+        let as_task = core.update_task_full(
+            note.id.clone(), None, None, None, None, Some("task".into()), None, false,
+            None, false, None, false, None, None, false, None, None,
+        ).unwrap();
+        assert_eq!(as_task.kind, "task");
+        assert_eq!(as_task.expected_minutes, Some(45));
+        assert_eq!(as_task.description.as_deref(), Some("正文"));
+
+        // task → note：completed_at 保留（转回时能恢复完成态）
+        core.update_task_full(
+            note.id.clone(), None, None, None, Some("done".into()), None, None, false,
+            None, false, None, false, None, None, false, None, None,
+        ).unwrap();
+        let back_to_note = core.update_task_full(
+            note.id.clone(), None, None, None, None, Some("note".into()), None, false,
+            None, false, None, false, None, None, false, None, None,
+        ).unwrap();
+        assert_eq!(back_to_note.kind, "note");
+        assert!(back_to_note.completed_at.is_some(), "转笔记后应保留 completed_at 以便转回时恢复");
+
+        // 清除预计时长
+        let cleared = core.update_task_full(
+            note.id.clone(), None, None, None, None, None, None, true,
+            None, false, None, false, None, None, false, None, None,
+        ).unwrap();
+        assert_eq!(cleared.expected_minutes, None);
+    }
+
+    /// 非法 kind 归一为 task；非法预计时长（0/负数）视为未设置。
+    #[test]
+    fn test_kind_and_minutes_validation() {
+        let core = make_in_memory();
+        let t = core.create_task_ex(
+            "脏值".into(), None, "medium".into(), None, None, None, None, None, None,
+            "  NOTE  ".into(), Some(0),
+        ).unwrap();
+        assert_eq!(t.kind, "note", "大小写/空格应归一");
+        assert_eq!(t.expected_minutes, None, "0 分钟应视为未设置");
+
+        let t2 = core.create_task_ex(
+            "乱写".into(), None, "medium".into(), None, None, None, None, None, None,
+            "whatever".into(), Some(-5),
+        ).unwrap();
+        assert_eq!(t2.kind, "task");
+        assert_eq!(t2.expected_minutes, None);
+    }
+
+    /// 子笔记搜索：include_children=false 只搜根，true 时子笔记可见。
+    #[test]
+    fn test_search_notes_include_children() {
+        let core = make_in_memory();
+        let nb = core.create_checklist_with_type("笔记本".into(), "notebook".into()).unwrap();
+        let root = core.create_task_ex(
+            "根笔记".into(), Some("包含关键词 检索".into()), "medium".into(),
+            Some(nb.id.clone()), None, None, None, None, None, "note".into(), None,
+        ).unwrap();
+        let _child = core.create_task_ex(
+            "子笔记".into(), Some("子项也有 检索 这个词".into()), "medium".into(),
+            Some(nb.id.clone()), Some(root.id.clone()), None, None, None, None, "note".into(), None,
+        ).unwrap();
+
+        // 文档式搜索（UI 口径）：子笔记不可见
+        let roots_only = core.search_notes(Some("检索".into()), Some(nb.id.clone()), false).unwrap();
+        assert_eq!(roots_only.len(), 1, "根搜索不应返回子笔记");
+        assert_eq!(roots_only[0].id, root.id);
+
+        // AI 口径：完整视图
+        let all = core.search_notes(Some("检索".into()), Some(nb.id.clone()), true).unwrap();
+        assert_eq!(all.len(), 2, "包含子项的搜索应能看到子笔记");
+    }
+
+    /// 枚举笔记：query=None 时按清单枚举，且不返回 kind=task 的实体。
+    #[test]
+    fn test_search_notes_enumerate_without_query() {
+        let core = make_in_memory();
+        let nb = core.create_checklist_with_type("笔记本".into(), "notebook".into()).unwrap();
+        let note = core.create_task_ex(
+            "笔记甲".into(), None, "medium".into(), Some(nb.id.clone()), None, None, None, None, None,
+            "note".into(), None,
+        ).unwrap();
+        // 同一清单里手动建的任务（笔记型清单可以放任务，7.3 允许混排）
+        let task_in_nb = core.create_task(
+            "混排任务".into(), None, "medium".into(), Some(nb.id.clone()), None, None, None, None, None,
+        ).unwrap();
+
+        let listed = core.search_notes(None, Some(nb.id.clone()), false).unwrap();
+        assert_eq!(listed.len(), 1, "枚举笔记不应把任务算进来");
+        assert_eq!(listed[0].id, note.id);
+        assert_ne!(listed[0].id, task_in_nb.id);
+
+        // 跨清单枚举：只按 kind 过滤
+        let all_notes = core.search_notes(None, None, true).unwrap();
+        assert!(all_notes.iter().all(|n| n.kind == "note"));
+        assert!(all_notes.iter().any(|n| n.id == note.id));
+    }
+
+    /// 删除实体：直接子项上移一级（挂到被删实体的父级），更深层级不动，
+    /// 且双向关联里指向被删实体的 ID 被清理。
+    #[test]
+    fn test_delete_task_promotes_children_and_cleans_links() {
+        let core = make_in_memory();
+        let grand = core.create_task("祖父".into(), None, "medium".into(), None, None, None, None, None, None).unwrap();
+        let mid = core.create_task("中间".into(), None, "medium".into(), None, Some(grand.id.clone()), None, None, None, None).unwrap();
+        let child = core.create_task("侄辈".into(), None, "medium".into(), None, Some(mid.id.clone()), None, None, None, None).unwrap();
+        let deep = core.create_task("孙辈".into(), None, "medium".into(), None, Some(child.id.clone()), None, None, None, None).unwrap();
+
+        // 建一条笔记与 mid 双向关联，验证删除后另一端不残留
+        let nb = core.create_checklist_with_type("笔记".into(), "notebook".into()).unwrap();
+        let note = core.create_task_ex(
+            "相关笔记".into(), None, "medium".into(), Some(nb.id.clone()), None, None, None, None, None,
+            "note".into(), None,
+        ).unwrap();
+        core.link_note_to_task(note.id.clone(), mid.id.clone()).unwrap();
+        assert!(core.get_task(note.id.clone()).unwrap().linked_task_ids.is_some());
+
+        assert!(core.delete_task(mid.id.clone()).unwrap());
+
+        // 直接子项挂到祖父下
+        assert_eq!(core.get_task(child.id.clone()).unwrap().parent_id.as_deref(), Some(grand.id.as_str()));
+        // 更深层级保持不动
+        assert_eq!(core.get_task(deep.id.clone()).unwrap().parent_id.as_deref(), Some(child.id.as_str()));
+        // 被删实体查不到
+        assert!(core.get_task(mid.id.clone()).is_err());
+        // 关联被清理：笔记侧不再指向已删实体
+        let note_after = core.get_task(note.id.clone()).unwrap();
+        assert!(
+            note_after.linked_task_ids.as_deref().map(|s| s.is_empty()).unwrap_or(true),
+            "删除后笔记的关联列表应为空，实际: {:?}",
+            note_after.linked_task_ids
+        );
+        assert!(core.get_linked_tasks(note.id.clone()).unwrap().is_empty());
+    }
+
+    /// 删除根实体：子项提升为根（parent_id = NULL），不会变成悬空行。
+    #[test]
+    fn test_delete_root_promotes_children_to_root() {
+        let core = make_in_memory();
+        let root = core.create_task("根".into(), None, "medium".into(), None, None, None, None, None, None).unwrap();
+        let child = core.create_task("子".into(), None, "medium".into(), None, Some(root.id.clone()), None, None, None, None).unwrap();
+
+        core.delete_task(root.id.clone()).unwrap();
+        assert_eq!(core.get_task(child.id.clone()).unwrap().parent_id, None);
+        // 子项仍可被正常查询到（不再有悬空 parent）
+        assert_eq!(core.get_tasks().unwrap().len(), 1);
     }
 }

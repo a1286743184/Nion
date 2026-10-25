@@ -32,6 +32,8 @@ import uniffi.nion_core.TaskData
 fun taskToJson(task: TaskData): JSONObject = JSONObject().apply {
     put("id", task.id)
     put("name", task.name)
+    // kind 始终返回：模型必须知道手里这条是任务还是笔记（能否勾选、该走哪个入口）
+    put("kind", task.kind)
     put("status", task.status)
     put("priority", task.priority)
     // description: 非空时才输出
@@ -48,6 +50,8 @@ fun taskToJson(task: TaskData): JSONObject = JSONObject().apply {
     if (task.groupId != null) put("group_id", task.groupId)
     // focus_seconds: 仅非零时输出，0 是默认值
     if (task.focusSeconds > 0) put("focus_seconds", task.focusSeconds)
+    // expected_minutes: 仅在已规划时输出，缺省即「未规划时长」
+    if (task.expectedMinutes != null) put("expected_minutes", task.expectedMinutes)
     // completed_at: 仅已完成时输出
     if (task.completedAt != null) put("completed_at", task.completedAt)
 }
@@ -82,6 +86,255 @@ fun parseReminderParam(reminder: String): Triple<String?, String?, String?> {
 fun taskListToJson(tasks: List<TaskData>): JSONArray = JSONArray().apply {
     for (task in tasks) {
         put(taskToJson(task))
+    }
+}
+
+/**
+ * 实体查询的统一返回结构。
+ *
+ * 为什么统一：历史上 task 通道返回顶层 `tasks`、note 通道返回顶层 `notes`，
+ * 模型与前端各写一套解析分支，行为容易分叉。统一为 `{ "items": [...], "count": n }`，
+ * 元素自带 `kind` 区分任务/笔记。
+ *
+ * @param entities 查询到的实体列表（任务或笔记，可能混合）
+ * @param extra    需要附带的上下文键值（matched_checklists 等），并入返回对象
+ */
+fun entityQueryResult(entities: List<TaskData>, vararg extra: Pair<String, Any>): String {
+    return JSONObject().apply {
+        put("items", taskListToJson(entities))
+        put("count", entities.size)
+        extra.forEach { (k, v) -> put(k, v) }
+    }.toString()
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 统一变更集 —— 所有更新路径（id / ids / name / names）共用
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * 任务/笔记的组合变更集 —— 一次 `update_task_full` 调用要提交的全部内容。
+ *
+ * 存在意义（B1 结构性修复）：旧实现里 id/ids/name/names 四条定位路径各自拼字段、
+ * 各自调 `updateTaskParent` / `updateTaskGroup` / `updateTask`，只要其中某条路径漏一段，
+ * 就会出现「归属写进去了、字段更新报 No fields to update」这类假失败。现在四条路径
+ * 只负责「把定位符解析成 id」，字段解析与执行完全共用本类 + [applyTaskChangeSet]。
+ *
+ * @param fields                字段变更（Rust 侧为 Option，null = 不改）
+ * @param setGroup              是否应用分组变更（false = 不动分组）
+ * @param groupId               目标分组，配合 setGroup=true 使用；null 表示清除分组
+ * @param setParent             是否应用父子变更（false = 不动父子关系）
+ * @param parentId              目标父级，配合 setParent=true 使用；null 表示提升为根
+ * @param clearExpectedMinutes  是否清除预计时长
+ * @param clearReminder         是否清除一次性提醒
+ * @param descriptionAppend     追加模式的文本（仅笔记用）；null 表示非追加模式
+ */
+class TaskChangeSet(
+    val fields: FieldUpdates,
+    val setGroup: Boolean = false,
+    val groupId: String? = null,
+    val setParent: Boolean = false,
+    val parentId: String? = null,
+    val clearExpectedMinutes: Boolean = false,
+    val clearReminder: Boolean = false,
+    val descriptionAppend: String? = null,
+) {
+    /** 是否一个字段都没改（用于给出「没有任何变更」的清晰错误，而不是静默成功） */
+    val isEmpty: Boolean
+        get() = fields.isEmpty && !setGroup && !setParent && !clearExpectedMinutes &&
+            !clearReminder && descriptionAppend == null
+}
+
+/**
+ * 字段级变更 —— 对应 Rust `update_task_full` 的 Option 参数组。
+ *
+ * @param name              新名称
+ * @param description       新正文（追加模式时由 TaskChangeSet 合成后填入）
+ * @param priority          优先级
+ * @param status            状态
+ * @param kind              "task" / "note"，用于互转
+ * @param expectedMinutes   预计时长（分钟）
+ * @param categoryId        目标清单
+ * @param reminder          一次性提醒
+ * @param recurrenceRule    循环规则
+ * @param recurrenceReminderTime 循环提醒时间
+ */
+data class FieldUpdates(
+    val name: String? = null,
+    val description: String? = null,
+    val priority: String? = null,
+    val status: String? = null,
+    val kind: String? = null,
+    val expectedMinutes: Long? = null,
+    val categoryId: String? = null,
+    val reminder: String? = null,
+    val recurrenceRule: String? = null,
+    val recurrenceReminderTime: String? = null,
+) {
+    val isEmpty: Boolean
+        get() = name == null && description == null && priority == null && status == null &&
+            kind == null && expectedMinutes == null && categoryId == null && reminder == null &&
+            recurrenceRule == null && recurrenceReminderTime == null
+}
+
+/**
+ * 把工具参数解析成 [TaskChangeSet]。
+ *
+ * 只做「参数 → 变更集」的翻译，不碰数据库；归属名称解析集中在这里，
+ * 保证 id / ids / name / names 四条路径拿到的语义完全一致。
+ *
+ * @param params 工具参数
+ * @param core   NionCore（用于解析 group/checklist 名称）
+ * @param entityKindHint 实体类型提示："note" 时默认把 kind 写成 note；null 表示不改 kind
+ * @return 成功返回变更集；解析失败返回 null 并附带错误 JSON
+ */
+fun parseTaskChangeSet(
+    params: JSONObject,
+    core: NionCore,
+    entityKindHint: String? = null,
+): Pair<TaskChangeSet?, String> {
+    // reminder 参数：含 "T" → 一次性；否则视为每日循环时间
+    val reminderRaw = params.optString("reminder", "").takeIf { it.isNotEmpty() }
+    val (recRule, recTime, reminder) = if (reminderRaw != null) {
+        parseReminderParam(reminderRaw)
+    } else {
+        Triple(null, null, null)
+    }
+
+    // 归属目标：group 优先于 checklist（group 隐含所在清单）
+    val moveChecklist = params.optString("checklist", "").takeIf { it.isNotEmpty() }
+    val moveGroup = params.optString("group", "").takeIf { it.isNotEmpty() }
+
+    var categoryId: String? = null
+    var groupId: String? = null
+    var setGroup = false
+
+    if (moveGroup != null) {
+        val allChecklists = core.getChecklists()
+        val allGroups = allChecklists.flatMap { core.getGroupsByChecklist(it.id) }
+        val exact = allGroups.filter { it.name == moveGroup }
+        val matched = if (exact.isNotEmpty()) exact else allGroups.filter { it.name.contains(moveGroup) }
+        if (matched.isEmpty()) return null to """{"error":"未找到名称包含「$moveGroup」的分组"}"""
+        if (matched.size > 1) {
+            return null to """{"error":"找到多个名称包含「$moveGroup」的分组，请同时指定 checklist"}"""
+        }
+        groupId = matched[0].id
+        setGroup = true
+        categoryId = matched[0].checklistId
+    } else if (moveChecklist != null) {
+        val matchedChecklists = resolveChecklistsByName(moveChecklist, core)
+        if (matchedChecklists.isEmpty()) {
+            return null to """{"error":"未找到名称包含「$moveChecklist」的清单"}"""
+        }
+        if (matchedChecklists.size > 1) {
+            return null to """{"error":"找到多个名称包含「$moveChecklist」的清单"}"""
+        }
+        categoryId = matchedChecklists[0].id
+        // 移到新清单时清空旧分组：分组属于清单，跨清单保留旧分组会指到别人的分组
+        setGroup = true
+        groupId = null
+    }
+
+    // parent：有值则挂载，显式空串则提升为根
+    val parentRaw = params.optString("parent", "")
+    val hasParentParam = params.has("parent")
+    var setParent = false
+    var parentId: String? = null
+    if (hasParentParam) {
+        setParent = true
+        if (parentRaw.isNotEmpty()) {
+            val (resolved, err) = resolveTaskIdByName(parentRaw, null, null, core)
+            if (resolved == null) return null to err
+            parentId = resolved
+        }
+    }
+
+    // 预计时长：0/负数视为非法，直接拒绝而不是静默忽略 —— 模型给了错值必须让它知道
+    val minutesRaw = params.opt("expected_minutes")
+    val expected = when (minutesRaw) {
+        null, JSONObject.NULL -> null
+        is Number -> minutesRaw.toLong()
+        is String -> minutesRaw.trim().toLongOrNull() ?: return null to """{"error":"expected_minutes 必须是整数分钟"}"""
+        else -> return null to """{"error":"expected_minutes 必须是整数分钟"}"""
+    }
+    if (expected != null && expected <= 0) {
+        return null to """{"error":"expected_minutes 必须为正整数（分钟）；要清除请传 clear_expected_minutes=true"}"""
+    }
+    val clearMinutes = params.optBoolean("clear_expected_minutes", false)
+
+    // 正文：append 模式（仅笔记）合成后的文本在这里先留空，执行时按当前内容拼接
+    val descriptionParam = params.optString("description", "").takeIf { it.isNotEmpty() }
+    val appendMode = params.optBoolean("append", false) && descriptionParam != null
+
+    // kind：显式 kind 参数优先；否则按调用方给的实体类型提示
+    val kindParam = params.optString("kind", "").takeIf { it.isNotEmpty() }
+        ?: entityKindHint
+
+    val fields = FieldUpdates(
+        name = params.optString("new_name", "").takeIf { it.isNotEmpty() },
+        description = if (appendMode) null else descriptionParam,
+        priority = params.optString("priority", "").takeIf { it.isNotEmpty() },
+        status = params.optString("status", "").takeIf { it.isNotEmpty() },
+        kind = kindParam,
+        expectedMinutes = expected,
+        categoryId = categoryId,
+        reminder = reminder,
+        recurrenceRule = recRule,
+        recurrenceReminderTime = recTime,
+    )
+
+    return TaskChangeSet(
+        fields = fields,
+        setGroup = setGroup,
+        groupId = groupId,
+        setParent = setParent,
+        parentId = parentId,
+        clearExpectedMinutes = clearMinutes,
+        clearReminder = params.optBoolean("clear_reminder", false),
+        descriptionAppend = if (appendMode) descriptionParam else null,
+    ) to ""
+}
+
+/**
+ * 对单个实体执行变更集 —— 一次 `update_task_full`，字段与归属同事务提交。
+ *
+ * @param id    目标实体 ID
+ * @param change 变更集
+ * @param core  NionCore
+ * @return 成功时 Pair<更新后的实体, "">；失败时 Pair<null, 错误 JSON>
+ */
+fun applyTaskChangeSet(id: String, change: TaskChangeSet, core: NionCore): Pair<TaskData?, String> {
+    // 追加模式：先读当前正文再拼接（读取与写入在同一调用栈内完成，
+    // 期间不会有其它写者插入 —— Rust 侧单 Mutex + 事务保证）
+    val effectiveDescription = if (change.descriptionAppend != null) {
+        val existing = core.getTask(id).description ?: ""
+        if (existing.isEmpty()) change.descriptionAppend else "$existing\n\n${change.descriptionAppend}"
+    } else {
+        change.fields.description
+    }
+
+    return try {
+        val updated = core.updateTaskFull(
+            id = id,
+            name = change.fields.name,
+            description = effectiveDescription,
+            priority = change.fields.priority,
+            status = change.fields.status,
+            kind = change.fields.kind,
+            expectedMinutes = change.fields.expectedMinutes,
+            clearExpectedMinutes = change.clearExpectedMinutes,
+            categoryId = change.fields.categoryId,
+            setGroup = change.setGroup,
+            groupId = change.groupId,
+            setParent = change.setParent,
+            parentId = change.parentId,
+            reminder = change.fields.reminder,
+            clearReminder = change.clearReminder,
+            recurrenceRule = change.fields.recurrenceRule,
+            recurrenceReminderTime = change.fields.recurrenceReminderTime,
+        )
+        updated to ""
+    } catch (e: Exception) {
+        null to """{"error":"${(e.message ?: "更新失败").replace("\"", "\\\"")}"}"""
     }
 }
 
@@ -310,7 +563,11 @@ private fun buildScopeHint(checklistName: String?, groupName: String?): String {
 object QueryTool : Tool {
     override val name = "query"
     override val affectsData = emptySet<DataType>()
-    override val description = "查询数据。entity_type: task/checklist/group/note/weather。可用 checklist/group 按名称筛选，name 按名称搜索。note 类型支持全文搜索标题和正文。"
+    override val description =
+        "查询数据。entity_type: task/checklist/group/note/weather。" +
+            "可用 checklist/group 按名称筛选，name 按名称搜索。" +
+            "note 通道带 name 时全文搜索（含子笔记），不带 name 时枚举笔记。" +
+            "task 通道可加 kind 只查任务或只查笔记。结果统一为 items 数组，每项带 kind。"
 
     private val schema = """
     {
@@ -323,6 +580,11 @@ object QueryTool : Tool {
             "checklist": { "type": "string" },
             "group": { "type": "string" },
             "name": { "type": "string" },
+            "kind": {
+                "type": "string",
+                "enum": ["task", "note"],
+                "description": "按实体类型过滤：task=可勾选任务，note=笔记。不填则两者都返回"
+            },
             "type": {
                 "type": "string",
                 "enum": ["current", "forecast"]
@@ -349,9 +611,41 @@ object QueryTool : Tool {
 
     /**
      * 任务查询路由。
-     * 优先级：name 按名字搜 > checklist+group > checklist > group > 全部
+     * 优先级：name 按名字搜 > checklist+group > checklist > group > 全部。
+     *
+     * kind 参数在最后统一过滤一次（而不是每条分支各过滤一遍），
+     * 保证任何筛选路径下 kind 语义一致。
      */
     private fun executeTaskQuery(params: JSONObject, core: NionCore): String {
+        val raw = executeTaskQueryUnfiltered(params, core)
+        val kindFilter = params.optString("kind", "").takeIf { it.isNotEmpty() } ?: return raw
+        return filterQueryResultByKind(raw, kindFilter)
+    }
+
+    /**
+     * 对统一查询结果按 kind 过滤并重算 count。
+     *
+     * @param raw        `{ "items": [...], "count": n, ... }` 结构的 JSON 字符串
+     * @param kind       目标 kind（"task" / "note"）
+     */
+    private fun filterQueryResultByKind(raw: String, kind: String): String {
+        val obj = try {
+            JSONObject(raw)
+        } catch (_: Exception) {
+            return raw
+        }
+        val items = obj.optJSONArray("items") ?: return raw
+        val kept = JSONArray()
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            if (item.optString("kind") == kind) kept.put(item)
+        }
+        obj.put("items", kept)
+        obj.put("count", kept.length())
+        return obj.toString()
+    }
+
+    private fun executeTaskQueryUnfiltered(params: JSONObject, core: NionCore): String {
         val nameParam = params.optString("name", "").takeIf { it.isNotEmpty() }
         val checklistParam = params.optString("checklist", "").takeIf { it.isNotEmpty() }
         val groupParam = params.optString("group", "").takeIf { it.isNotEmpty() }
@@ -362,10 +656,7 @@ object QueryTool : Tool {
             // 精确匹配优先
             val exact = allTasks.filter { it.name == nameParam }
             val matched = if (exact.isNotEmpty()) exact else allTasks.filter { it.name.contains(nameParam) }
-            return JSONObject().apply {
-                put("tasks", taskListToJson(matched))
-                put("count", matched.size)
-            }.toString()
+            return entityQueryResult(matched)
         }
 
         // 按清单名称 + 分组名称筛选
@@ -386,30 +677,26 @@ object QueryTool : Tool {
                 val tasks = matchedGroups.flatMap { group ->
                     core.getTasksByCategory(group.checklistId, group.id)
                 }
-                return JSONObject().apply {
-                    put("tasks", taskListToJson(tasks))
-                    put("count", tasks.size)
-                    // 多匹配时标注匹配了哪些清单和分组
-                    if (matchedChecklists.size > 1) {
-                        put("matched_checklists", JSONArray(matchedChecklists.map { it.name }))
-                    }
-                    if (matchedGroups.size > 1) {
-                        put("matched_groups", JSONArray(matchedGroups.map { it.name }))
-                    }
-                }.toString()
+                // 多匹配时标注匹配了哪些清单和分组（额外键并入统一返回结构）
+                val extras = mutableListOf<Pair<String, Any>>()
+                if (matchedChecklists.size > 1) {
+                    extras += "matched_checklists" to JSONArray(matchedChecklists.map { it.name })
+                }
+                if (matchedGroups.size > 1) {
+                    extras += "matched_groups" to JSONArray(matchedGroups.map { it.name })
+                }
+                return entityQueryResult(tasks, *extras.toTypedArray())
             }
 
             // 只按清单筛选，不限定分组
             val tasks = checklistIds.flatMap { cid ->
                 core.getTasksByCategory(cid, null)
             }
-            return JSONObject().apply {
-                put("tasks", taskListToJson(tasks))
-                put("count", tasks.size)
-                if (matchedChecklists.size > 1) {
-                    put("matched_checklists", JSONArray(matchedChecklists.map { it.name }))
-                }
-            }.toString()
+            return if (matchedChecklists.size > 1) {
+                entityQueryResult(tasks, "matched_checklists" to JSONArray(matchedChecklists.map { it.name }))
+            } else {
+                entityQueryResult(tasks)
+            }
         }
 
         // 只按分组名称筛选，无 checklist：全局搜分组名匹配 → 查询任务
@@ -422,21 +709,15 @@ object QueryTool : Tool {
             val tasks = matchedGroups.flatMap { group ->
                 core.getTasksByCategory(group.checklistId, group.id)
             }
-            return JSONObject().apply {
-                put("tasks", taskListToJson(tasks))
-                put("count", tasks.size)
-                if (matchedGroups.size > 1) {
-                    put("matched_groups", JSONArray(matchedGroups.map { it.name }))
-                }
-            }.toString()
+            return if (matchedGroups.size > 1) {
+                entityQueryResult(tasks, "matched_groups" to JSONArray(matchedGroups.map { it.name }))
+            } else {
+                entityQueryResult(tasks)
+            }
         }
 
         // 无筛选参数：返回全部任务
-        val tasks = core.getTasks()
-        return JSONObject().apply {
-            put("tasks", taskListToJson(tasks))
-            put("count", tasks.size)
-        }.toString()
+        return entityQueryResult(core.getTasks())
     }
 
     /**
@@ -605,31 +886,46 @@ object QueryTool : Tool {
     }
 
     /**
-     * 笔记查询 —— 全文搜索笔记型清单中的笔记。
-     * 使用 Rust 核心库的 searchNotes 方法，匹配笔记标题（name）和正文（description）。
-     * 可通过 checklist 参数限定搜索范围。
+     * 笔记查询 —— 搜索或枚举笔记（kind=note 的实体）。
+     *
+     * 两种用法：
+     * - 带 name：全文搜索标题与正文，包含子笔记（AI 需要完整视图）；
+     * - 不带 name：按 checklist（可选）枚举笔记，用于「我有哪些笔记」这类问题。
+     *
+     * 返回结构与 task 通道统一为 `{ "items": [...], "count": n }`，元素含 kind。
      */
     private fun executeNoteQuery(params: JSONObject, core: NionCore): String {
         val nameParam = params.optString("name", "").takeIf { it.isNotEmpty() }
-            ?: return """{"error":"查询笔记必须提供 name（搜索关键词）"}"""
-
         val checklistParam = params.optString("checklist", "").takeIf { it.isNotEmpty() }
 
-        // 解析可选的清单范围：找到名称匹配的笔记型清单
+        // 解析可选的清单范围（笔记可以出现在任意清单里，按名称匹配即可，不再要求 notebook 型）
         val checklistId: String? = if (checklistParam != null) {
             val matched = resolveChecklistsByName(checklistParam, core)
-                .filter { it.checklistType == "notebook" }
             if (matched.isEmpty()) {
-                return """{"error":"未找到名称包含「$checklistParam」的笔记型清单"}"""
+                return """{"error":"未找到名称包含「$checklistParam」的清单"}"""
             }
             matched.first().id
         } else null
 
-        val notes = core.searchNotes(nameParam, checklistId)
-        return JSONObject().apply {
-            put("notes", taskListToJson(notes))
-            put("count", notes.size)
-        }.toString()
+        // 有 name → 搜索（含子笔记）；无 name → 枚举
+        val notes = core.searchNotes(nameParam, checklistId, nameParam != null)
+        return entityQueryResult(notes)
+    }
+}
+
+/**
+ * 读取可选的整数字段。
+ *
+ * 与 `optInt` 的区别：JSON 里可能传来字符串形式的数字（模型常把 "45" 当字符串），
+ * 也可能传来 null；这里统一返回 null 表示「未提供/非法」，由调用方决定语义。
+ */
+fun JSONObject.optLongOrNull(key: String): Long? {
+    if (!has(key) || isNull(key)) return null
+    val v = opt(key)
+    return when (v) {
+        is Number -> v.toLong()
+        is String -> v.trim().toLongOrNull()
+        else -> null
     }
 }
 
@@ -662,7 +958,10 @@ object CreateTool : Tool {
             "每日重复任务用 HH:MM 格式如 08:00，" +
             "一次性任务用 YYYY-MM-DDTHH:MM 格式如 2026-06-15T09:00。" +
             "不要只写标题不设时间。" +
-            "创建清单时可传 checklist_type=\"notebook\" 来新建笔记型清单（默认 task）。"
+            "note 通道创建笔记，同样支持 checklist/group/parent；" +
+            "不懂预计工作量时不要填 expected_minutes。" +
+            "创建清单时可传 checklist_type=\"notebook\" 来新建笔记型清单（默认 task）。" +
+            "笔记与任务是同一种实体，可以互转，区别只是能否勾选完成。"
 
     /**
      * 参数 Schema。
@@ -693,6 +992,10 @@ object CreateTool : Tool {
             "reminder": {
                 "type": "string",
                 "description": "提醒时间。\"HH:MM\"格式为每日循环提醒，\"YYYY-MM-DDTHH:MM\"格式为一次性提醒"
+            },
+            "expected_minutes": {
+                "type": "integer",
+                "description": "预计总工作量（分钟），正整数。用户没说要花多久就不要填"
             },
             "color": { "type": "string" },
             "items": {
@@ -854,7 +1157,14 @@ object CreateTool : Tool {
             Triple(null, null, null)
         }
 
-        val task = core.createTask(
+        // expected_minutes 必须为正整数；给了非法值直接报错而不是静默丢弃，
+        // 否则排期工具拿到「未规划时长」会把任务塞进 unplaced，用户却以为自己填了值
+        val minutes = params.optLongOrNull("expected_minutes")
+        if (minutes != null && minutes <= 0) {
+            return """{"error":"expected_minutes 必须为正整数（分钟）"}"""
+        }
+
+        val task = core.createTaskEx(
             name = name,
             description = params.optString("description", "").takeIf { it.isNotEmpty() },
             priority = params.optString("priority", "medium"),
@@ -864,18 +1174,24 @@ object CreateTool : Tool {
             recurrenceRule = recurrenceRule,
             recurrenceReminderTime = recurrenceReminderTime,
             reminder = reminder,
+            // entity_type=task 时固定写 kind=task；用户想建笔记应走 entity_type=note
+            kind = "task",
+            expectedMinutes = minutes,
         )
-        val finalTask = task
         return JSONObject().apply {
             put("success", true)
-            put("task", taskToJson(finalTask))
+            put("task", taskToJson(task))
         }.toString()
     }
 
     /**
-     * 创建笔记 —— 在指定的笔记型清单中新建一条笔记。
+     * 创建笔记 —— 在指定清单中新建一条 kind=note 的实体。
      * 笔记复用 task 结构：name=标题，description=Markdown 正文。
-     * checklist 参数必须指向一个笔记型清单（checklist_type=notebook）。
+     *
+     * 与 task 通道的差异（4.2 定稿）：
+     * - checklist 可选：不指定时创建到收集箱（category_id 为空）；
+     * - 支持 parent：可以在任务下挂子笔记，也可以在笔记下继续挂笔记或任务；
+     * - 显式写入 kind='note'，不再依赖「目标清单是 notebook 型」推导类型。
      */
     private fun executeCreateNote(params: JSONObject, core: NionCore): String {
         val title = params.optString("name", "").takeIf { it.isNotEmpty() }
@@ -883,25 +1199,32 @@ object CreateTool : Tool {
 
         val content = params.optString("description", "").takeIf { it.isNotEmpty() }
         val checklistName = params.optString("checklist", "").takeIf { it.isNotEmpty() }
-            ?: return """{"error":"创建笔记时必须指定 checklist（目标笔记本名称）"}"""
+        val groupName = params.optString("group", "").takeIf { it.isNotEmpty() }
+        val parentName = params.optString("parent", "").takeIf { it.isNotEmpty() }
 
-        // 查找目标笔记型清单
-        val matchedChecklists = resolveChecklistsByName(checklistName, core)
-            .filter { it.checklistType == "notebook" }
-        if (matchedChecklists.isEmpty()) {
-            return """{"error":"未找到名称包含「$checklistName」的笔记型清单"}"""
-        }
+        // 复用任务归属解析：checklist/group/parent 三个名称口径与 task 通道完全一致
+        val (ownership, errorMsg) = resolveTaskOwnership(checklistName, groupName, parentName, core)
+        if (ownership == null) return errorMsg
+        val (categoryId, groupId, parentId) = ownership
 
-        val checklistId = matchedChecklists.first().id
-
-        // 笔记复用 createTask：name=标题，description=正文
-        val note = core.createTask(
-            title, content, "medium", checklistId,
-            null, null, null, null, null,
+        val note = core.createTaskEx(
+            name = title,
+            description = content,
+            priority = "medium",
+            categoryId = categoryId,
+            parentId = parentId,
+            groupId = groupId,
+            recurrenceRule = null,
+            recurrenceReminderTime = null,
+            reminder = null,
+            kind = "note",
+            expectedMinutes = params.optLongOrNull("expected_minutes"),
         )
         return JSONObject().apply {
             put("success", true)
             put("note", taskToJson(note))
+            // 同时给 task 键：调用方按 entity_type=note 时取 note，其它情况也能读到
+            put("task", taskToJson(note))
         }.toString()
     }
 
@@ -969,9 +1292,13 @@ object CreateTool : Tool {
             val itemParams = items.getJSONObject(i)
             try {
                 when (entityType) {
-                    "task" -> {
+                    // task 与 note 走同一段逻辑，只差写入的 kind（4.2 通道统一）
+                    "task", "note" -> {
+                        val isNote = entityType == "note"
                         val name = itemParams.optString("name", "").takeIf { it.isNotEmpty() }
-                            ?: throw IllegalArgumentException("批量创建任务时每项必须包含 name，第 ${i + 1} 项缺失")
+                            ?: throw IllegalArgumentException(
+                                "批量创建${if (isNote) "笔记" else "任务"}时每项必须包含 name，第 ${i + 1} 项缺失"
+                            )
                         // item 有值用 item 的，没有则 fallback 到外层参数
                         val checklistName = itemParams.optString("checklist", "").takeIf { it.isNotEmpty() } ?: outerChecklist
                         val groupName = itemParams.optString("group", "").takeIf { it.isNotEmpty() } ?: outerGroup
@@ -988,7 +1315,13 @@ object CreateTool : Tool {
                         } else {
                             Triple(null, null, null)
                         }
-                        val task = core.createTask(
+                        // 逐项校验预计时长：批量里某一项错了只让该项失败，不影响其它项
+                        val minutes = itemParams.optLongOrNull("expected_minutes")
+                            ?: params.optLongOrNull("expected_minutes")
+                        if (minutes != null && minutes <= 0) {
+                            throw IllegalArgumentException("expected_minutes 必须为正整数（分钟）")
+                        }
+                        val created = core.createTaskEx(
                             name = name,
                             description = itemParams.optString("description", "").takeIf { it.isNotEmpty() },
                             priority = itemParams.optString("priority", "medium"),
@@ -998,12 +1331,16 @@ object CreateTool : Tool {
                             recurrenceRule = recurrenceRule,
                             recurrenceReminderTime = recurrenceReminderTime,
                             reminder = reminder,
+                            kind = if (isNote) "note" else "task",
+                            expectedMinutes = minutes,
                         )
-                        val finalTask = task
+                        // 键名跟随 entity_type：note 通道给 note，task 通道给 task，
+                        // 两个键同时给出会让调用方难以判断究竟建成了什么
+                        val key = if (isNote) "note" else "task"
                         results.put(JSONObject().apply {
                             put("index", i)
                             put("success", true)
-                            put("task", taskToJson(finalTask))
+                            put(key, taskToJson(created))
                         })
                         successCount++
                     }
@@ -1088,7 +1425,11 @@ object CreateTool : Tool {
 object UpdateTool : Tool {
     override val name = "update"
     override val affectsData = setOf(DataType.TASK_DATA)
-    override val description = "更新实体。优先用id/ids精确定位，回退name/names。checklist/group/parent变更归属。支持批量。entity_type=note时append=true可追加内容。"
+    override val description =
+        "更新实体。优先用id/ids精确定位，回退name/names。" +
+            "checklist/group/parent 变更归属，kind 在 task/note 之间互转。" +
+            "支持批量。entity_type=note 时 append=true 可追加内容。" +
+            "笔记与任务是同一种实体的两种 kind，可以互转，区别只是能否勾选完成。"
 
     private val schema = """
     {
@@ -1126,6 +1467,23 @@ object UpdateTool : Tool {
             "checklist": { "type": "string", "description": "将任务移到目标清单，按名称匹配，不是范围筛选" },
             "group": { "type": "string", "description": "将任务移到目标分组，按名称匹配，自动继承分组的清单" },
             "parent": { "type": "string", "description": "挂到目标父任务下，按名称匹配，传空字符串清除父任务" },
+            "kind": {
+                "type": "string",
+                "enum": ["task", "note"],
+                "description": "实体类型互转：task=可勾选的任务，note=笔记。转换不会丢失内容、关联与专注记录"
+            },
+            "expected_minutes": {
+                "type": "integer",
+                "description": "预计总工作量（分钟），正整数。未规划时不要填，不要猜"
+            },
+            "clear_expected_minutes": {
+                "type": "boolean",
+                "description": "true=清除预计时长"
+            },
+            "clear_reminder": {
+                "type": "boolean",
+                "description": "true=清除一次性提醒"
+            },
             "reminder": {
                 "type": "string",
                 "description": "提醒时间，HH:MM每日循环，YYYY-MM-DDTHH:MM一次性"
@@ -1141,8 +1499,7 @@ object UpdateTool : Tool {
     override suspend fun execute(params: JSONObject, core: NionCore): String {
         val entityType = params.getString("entity_type")
 
-        // note 类型复用 task 的更新逻辑（笔记本质是 task），追加模式单独处理
-        // 将 entity_type=note 映射为 task，让后续 ID/名称解析逻辑正常工作
+        // note 类型复用 task 的更新逻辑（笔记与任务是同一实体的两种 kind）
         val effectiveType = if (entityType == "note") "task" else entityType
 
         // ── ID 路径：优先级最高，跳过所有名称解析 ──
@@ -1154,7 +1511,8 @@ object UpdateTool : Tool {
         val singleId = params.optString("id", "").takeIf { it.isNotEmpty() }
         if (singleId != null) {
             return when (effectiveType) {
-                "task" -> executeUpdateTask("", params, core, resolvedId = singleId)
+                // 显式指定 id 时不写 kind：避免「调用方只是在改标题」却被默认改成 task
+                "task" -> executeUpdateTask("", params, core, resolvedId = singleId, kindHint = null)
                 "checklist" -> executeUpdateChecklist("", params, core, resolvedId = singleId)
                 "group" -> executeUpdateGroup("", params, core, resolvedId = singleId)
                 else -> """{"error":"不支持的 entity_type: $entityType"}"""
@@ -1170,8 +1528,10 @@ object UpdateTool : Tool {
         val name = params.optString("name", "").takeIf { it.isNotEmpty() }
             ?: return """{"error":"更新操作必须指定 id、ids、name 或 names"}"""
 
+        // 名称路径下 entity_type=note 可作为 kind 提示（用户说「把这条笔记……」）。
+        // 但如果参数里已经有显式 kind，以显式为准（fromParams 内部处理优先级）。
         return when (effectiveType) {
-            "task" -> executeUpdateTask(name, params, core)
+            "task" -> executeUpdateTask(name, params, core, kindHint = if (entityType == "note") "note" else null)
             "checklist" -> executeUpdateChecklist(name, params, core)
             "group" -> executeUpdateGroup(name, params, core)
             else -> """{"error":"不支持的 entity_type: $entityType"}"""
@@ -1302,24 +1662,30 @@ object UpdateTool : Tool {
     }
 
     /**
-     * 更新任务 —— 同时支持字段修改和归属移动。
+     * 更新单个实体 —— 字段修改与归属移动一次事务提交。
      *
      * 定位方式：
      * - resolvedId 非空时直接使用 ID，跳过名称解析
-     * - 否则用 name 全局解析任务名称（不做范围限定，重名时报错）
+     * - 否则用 name 全局解析名称（不做范围限定，重名时报错）
      *
-     * checklist/group/parent 参数用于变更归属：
-     * - checklist：移到目标清单，同时清除旧分组
-     * - group：移到目标分组，自动继承分组的清单（group 优先级 > checklist）
-     * - parent：挂到目标父任务下；传空字符串清除父任务（提升为根任务）
-     * - 同时指定 group + checklist 时，group 的清单优先
+     * 字段解析与执行完全交给 [TaskChangeSet.fromParams] + [applyTaskChangeSet]，
+     * 与 ids / names 批量路径共用同一套语义 —— 这是消灭「报错但已写入」的关键：
+     * 旧实现在这里分四次调用（parent → group → clear → update），只改归属就会被
+     * updateTask 的 `No fields to update` 打成假失败。
      *
-     * @param name        任务名称（resolvedId 为空时用于名称解析）
+     * @param name        实体名称（resolvedId 为空时用于名称解析）
      * @param params      参数对象
      * @param core        NionCore 单例
-     * @param resolvedId  预解析的任务 ID，非空时跳过名称解析
+     * @param resolvedId  预解析的实体 ID，非空时跳过名称解析
+     * @param kindHint    实体类型提示（entity_type=note 时传 "note"），null 表示不写 kind
      */
-    private fun executeUpdateTask(name: String, params: JSONObject, core: NionCore, resolvedId: String? = null): String {
+    private fun executeUpdateTask(
+        name: String,
+        params: JSONObject,
+        core: NionCore,
+        resolvedId: String? = null,
+        kindHint: String? = null,
+    ): String {
         // ID 定位：resolvedId 非空时直接使用；否则走名称解析
         val id: String
         if (resolvedId != null) {
@@ -1330,88 +1696,24 @@ object UpdateTool : Tool {
             id = resolved
         }
 
-        // ── 归属变更参数 ──
-        val moveChecklist = params.optString("checklist", "").takeIf { it.isNotEmpty() }
-        val moveGroup = params.optString("group", "").takeIf { it.isNotEmpty() }
-        val moveParent = params.optString("parent", "").takeIf { it.isNotEmpty() }
-        // parent="" 表示清除父任务（提升为根任务）
-        val clearParent = params.has("parent") && params.optString("parent", "").isEmpty()
+        // 参数 → 变更集（含归属名称解析）。解析失败时零写入
+        val (change, parseErr) = parseTaskChangeSet(params, core, kindHint)
+        if (change == null) return parseErr
 
-        // ── 解析归属变更目标 ──
-        var newCategoryId: String? = null
-        var newGroupId: String? = null
-        var needClearGroup = false
-
-        if (moveGroup != null) {
-            // 移到分组：解析分组名 → 同时获得 groupId 和继承的 checklistId
-            val allChecklists = core.getChecklists()
-            val allGroups = allChecklists.flatMap { core.getGroupsByChecklist(it.id) }
-            val exact = allGroups.filter { it.name == moveGroup }
-            val matched = if (exact.isNotEmpty()) exact else allGroups.filter { it.name.contains(moveGroup) }
-            if (matched.isEmpty()) return """{"error":"未找到名称包含「$moveGroup」的分组"}"""
-            if (matched.size > 1) return """{"error":"找到多个名称包含「$moveGroup」的分组，请同时指定 checklist"}"""
-            newGroupId = matched[0].id
-            // group 优先：自动继承分组的清单归属
-            newCategoryId = matched[0].checklistId
-        } else if (moveChecklist != null) {
-            // 移到清单：解析清单名 → 设置新 checklistId，清除旧分组
-            val matchedChecklists = resolveChecklistsByName(moveChecklist, core)
-            if (matchedChecklists.isEmpty()) return """{"error":"未找到名称包含「$moveChecklist」的清单"}"""
-            if (matchedChecklists.size > 1) return """{"error":"找到多个名称包含「$moveChecklist」的清单"}"""
-            newCategoryId = matchedChecklists[0].id
-            needClearGroup = true
+        // 一个字段都没给：明确指出问题，而不是静默「成功」
+        if (change.isEmpty) {
+            return """{"error":"没有需要更新的字段，请至少提供 new_name/description/priority/status/kind/checklist/group/parent/reminder 之一"}"""
         }
 
-        // ── 处理父任务变更 ──
-        if (moveParent != null) {
-            val (parentId, parentErr) = resolveTaskIdByName(moveParent, null, null, core)
-            if (parentId == null) return parentErr
-            if (id == parentId) return """{"error":"不能把任务变成自己的子任务"}"""
-            core.updateTaskParent(id, parentId)
-        } else if (clearParent) {
-            core.updateTaskParent(id, null)
-        }
+        val (task, applyErr) = applyTaskChangeSet(id, change, core)
+        if (task == null) return applyErr
 
-        // ── 清除旧分组（移到新清单时） ──
-        if (needClearGroup) {
-            core.updateTaskGroup(id, null)
-        }
-
-        // ── 解析 reminder 参数 ──
-        val reminderRaw = params.optString("reminder", "").takeIf { it.isNotEmpty() }
-        val (recurrenceRule, recurrenceReminderTime, reminder) = if (reminderRaw != null) {
-            parseReminderParam(reminderRaw)
-        } else {
-            Triple(null, null, null)
-        }
-
-        // ── 执行更新 ──
-        // append 模式（仅笔记）：先读取原 description，追加新内容而非替换
-        val descriptionParam = params.optString("description", "").takeIf { it.isNotEmpty() }
-        val appendMode = params.optBoolean("append", false) && descriptionParam != null
-        val finalDescription = if (appendMode) {
-            // 追加模式：读取当前内容，在末尾追加新内容
-            val existing = core.getTask(id).description ?: ""
-            if (existing.isEmpty()) descriptionParam else "$existing\n\n$descriptionParam"
-        } else {
-            descriptionParam
-        }
-
-        val task = core.updateTask(
-            id = id,
-            name = params.optString("new_name", "").takeIf { it.isNotEmpty() },
-            description = finalDescription,
-            priority = params.optString("priority", "").takeIf { it.isNotEmpty() },
-            status = params.optString("status", "").takeIf { it.isNotEmpty() },
-            categoryId = newCategoryId,
-            reminder = reminder,
-            groupId = newGroupId,
-            recurrenceRule = recurrenceRule,
-            recurrenceReminderTime = recurrenceReminderTime,
-        )
         return JSONObject().apply {
             put("success", true)
+            // 同时给出 task 与 note 两个键：调用方按 entity_type 取值，
+            // 而实际 kind 可能与 entity_type 不同（互转场景），两个键都指向同一实体
             put("task", taskToJson(task))
+            put("note", taskToJson(task))
         }.toString()
     }
 
@@ -1834,7 +2136,8 @@ object ManageTool : Tool {
                 // 按名称搜索笔记
                 val noteName = params.optString("note_name", "").takeIf { it.isNotEmpty() }
                     ?: return """{"error":"link/unlink 操作必须指定 note_id 或 note_name"}"""
-                val notes = core.searchNotes(noteName, null)
+                // 按名称搜索笔记：include_children=true，子笔记也能被关联到
+                val notes = core.searchNotes(noteName, null, true)
                 notes.firstOrNull()?.id
                     ?: return """{"error":"未找到名称包含「$noteName」的笔记"}"""
             }

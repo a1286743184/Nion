@@ -19,6 +19,13 @@ pub struct ChecklistData {
     pub created_at: String,
 }
 
+/// 统一实体数据 —— 任务与笔记是同一种实体的两种 kind。
+///
+/// 类型（kind）是实体自身的属性，不再由所在清单推导：
+/// - `kind = "task"`：可勾选，status / completed_at 语义完整；
+/// - `kind = "note"`：无勾选语义，status 字段物理保留但不参与 UI 判断。
+///
+/// 清单的 checklist_type 只决定「新建时的默认 kind」与视图语境，不再决定已有实体的渲染方式。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, uniffi::Record)]
 pub struct TaskData {
     pub id: String,
@@ -42,6 +49,12 @@ pub struct TaskData {
     /// 用于笔记-任务双向关联：笔记的 linked_task_ids 存储关联的任务 ID，
     /// 任务的 linked_task_ids 存储关联的笔记 ID。None 表示无关联。
     pub linked_task_ids: Option<String>,
+    /// 实体类型："task"（可勾选）或 "note"（笔记，无勾选语义）
+    pub kind: String,
+    /// 预计总工作量（分钟）。NULL = 未规划时长。
+    /// 这是「预计投入」而非结束时间：时间占用由 reminder（起点）+ 本字段派生，
+    /// 不新增独立的结束时间字段。
+    pub expected_minutes: Option<i64>,
 }
 
 /// 任务分组 —— 清单下的二级分类，例如"学习清单"下的"语文"、"英语"
