@@ -26,6 +26,13 @@ internal fun DailyTaskStatus.toUi(): TaskItem {
         reminder = task.reminder,
         isDaily = isDaily,
         isCompletedForDate = completedForDate,
+        // 类型与元信息同样透传，列表中按实体真实 kind 渲染
+        kind = task.kind,
+        expectedMinutes = task.expectedMinutes,
+        parentId = task.parentId,
+        categoryId = task.categoryId,
+        groupId = task.groupId,
+        linkedIds = task.linkedTaskIds,
     )
 }
 
@@ -49,6 +56,13 @@ internal fun TaskData.toUi(): TaskItem {
         reminder = reminder,
         isDaily = isDaily,
         isCompletedForDate = isDaily && status == "done",
+        // 类型来自实体自身（B3）：渲染不再依赖所在清单的 checklist_type
+        kind = kind,
+        expectedMinutes = expectedMinutes,
+        parentId = parentId,
+        categoryId = categoryId,
+        groupId = groupId,
+        linkedIds = linkedTaskIds,
     )
 }
 

@@ -230,7 +230,11 @@ private fun MainTaskRow(
     val borderColor = MaterialTheme.colorScheme.primary
     val borderWidth = with(LocalDensity.current) { 2.dp.toPx() }
 
-    // 将 TaskItem 映射为共享数据模型
+    // 笔记外观以实体 kind 为准（B3）：清单语境只作为兼容兜底
+    val noteMode = task.isNote || isNotebook
+
+    // 将 TaskItem 映射为共享数据模型。kind 与预计时长透传：
+    // 卡片外观由实体 kind 决定，不再依赖所在清单是不是笔记型（B3）
     val cardModel = remember(task) {
         TaskCardModel(
             id = task.id,
@@ -241,6 +245,8 @@ private fun MainTaskRow(
             isDaily = task.isDaily,
             reminderTime = task.recurrenceReminderTime,
             reminder = task.reminder,
+            kind = task.kind,
+            expectedMinutes = task.expectedMinutes,
         )
     }
 
@@ -267,7 +273,7 @@ private fun MainTaskRow(
         showCollapseArrow = showCollapseArrow,
         arrowRotation = arrowRotation,
         onToggleCollapse = { onToggleCollapse?.invoke(task.id) },
-        isNotebook = isNotebook,
+        isNotebook = noteMode,
         playCompletionAnim = playCompletionAnim,
         visualDone = visualDone,
         showBurst = showBurst,
@@ -332,8 +338,11 @@ private fun SubTaskRow(
     onCompletionAnimEnd: () -> Unit = {},
 ) {
     val task = item.task
-    // effectiveDone：实际视觉完成态。visualDone 非 null 时覆盖 task.isDone
-    val effectiveDone = visualDone ?: task.isDone
+    // 笔记外观以实体 kind 为准（B3）
+    val noteMode = task.isNote || isNotebook
+    // effectiveDone：实际视觉完成态。visualDone 非 null 时覆盖 task.isDone；
+    // 笔记没有完成语义，恒为 false（不出现划线、不进入已完成分区）
+    val effectiveDone = if (noteMode) false else (visualDone ?: task.isDone)
 
     val priorityColors = LocalPriorityColors.current
     val priorityColor = task.priority.priorityColor(priorityColors)
@@ -438,7 +447,7 @@ private fun SubTaskRow(
             .padding(start = indent + 16.dp, end = 16.dp, top = 6.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (isNotebook) {
+        if (noteMode) {
             // 笔记模式：显示笔记图标，不可点击切换完成
             androidx.compose.material3.Icon(
                 LucideIcons.FileText,

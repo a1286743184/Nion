@@ -64,6 +64,10 @@ import com.echonion.nion.ui.icons.LucideIcons
  *
  * 两个页面各自的 ViewModel 数据模型（TaskItem / ScheduleTaskItem）
  * 通过 toCardModel() 扩展函数映射到此类型，供 SharedTaskCard 消费。
+ *
+ * @param kind 实体类型 "task" / "note"。卡片外观由它决定，
+ *   调用方不再通过 isNotebook 之类的「所在清单语境」来改外观。
+ * @param expectedMinutes 预计总工作量（分钟），null = 未规划
  */
 data class TaskCardModel(
     val id: String,
@@ -75,7 +79,14 @@ data class TaskCardModel(
     val reminderTime: String? = null,
     /** 一次性提醒时间，格式 "YYYY-MM-DDTHH:MM"，由卡片上的铃铛图标 + 完整日期时间展示 */
     val reminder: String? = null,
-)
+    /** 实体类型："task"（可勾选）或 "note"（笔记，无勾选语义） */
+    val kind: String = "task",
+    /** 预计总工作量（分钟）；null = 未规划 */
+    val expectedMinutes: Long? = null,
+) {
+    /** 是否笔记实体 —— 决定图标、可勾选性与完成动画是否参与 */
+    val isNote: Boolean get() = kind == "note"
+}
 
 /**
  * 共享任务卡片 —— 任务列表和日程页面复用的任务行渲染组件。
@@ -126,7 +137,7 @@ fun SharedTaskCard(
     showCollapseArrow: Boolean = false,
     arrowRotation: Float = 0f,
     onToggleCollapse: (() -> Unit)? = null,
-    /** 笔记模式：true 时复选框替换为笔记图标 */
+    /** 笔记模式：true 时复选框替换为笔记图标（兼容旧调用点） */
     isNotebook: Boolean = false,
     /** 是否正在播放完成动画（由上层 animatingDoneIds 决定） */
     playCompletionAnim: Boolean = false,
@@ -139,9 +150,14 @@ fun SharedTaskCard(
     /** 完成动画全部播放完毕的回调，上层在此调用真正的 toggleDone */
     onCompletionAnimEnd: () -> Unit = {},
 ) {
+    // 笔记模式：以实体 kind 为准（7.3）。isNotebook 仅作为旧调用点的兼容参数，
+    // 一旦 model.kind 明确为 note/task 就以它为唯一依据，避免「清单类型」继续驱动外观。
+    val noteMode = model.isNote || isNotebook
+
     // effectiveDone：实际用于驱动视觉的完成态。visualDone 非 null 时覆盖 model.isDone，
-    // 使得动画期间（model.isDone 还是 false）UI 已经呈现已完成外观
-    val effectiveDone = visualDone ?: model.isDone
+    // 使得动画期间（model.isDone 还是 false）UI 已经呈现已完成外观。
+    // 笔记没有完成语义，永远按未完成渲染（不出现划线、不进入已完成分区）。
+    val effectiveDone = if (noteMode) false else (visualDone ?: model.isDone)
 
     // 背景色动画：已完成 → surfaceContainerLow，未完成 → surfaceContainerLowest。
     // 用 effectiveDone 替代原来的 model.isDone，让动画期间背景也跟着过渡
@@ -253,8 +269,8 @@ fun SharedTaskCard(
         // 爆发只在动画期间显示（playCompletionAnim=false 时即使 burstProgress 残留也不绘制）
         val burstDraw = if (playCompletionAnim) burstProgress.value else 0f
 
-        // 勾选框：笔记模式显示笔记图标，任务模式显示带动画的 checkbox + 可选爆发
-        if (isNotebook) {
+        // 勾选框：笔记显示文档图标（不可勾选），任务显示带动画的 checkbox + 可选爆发
+        if (noteMode) {
             Icon(
                 LucideIcons.FileText,
                 contentDescription = null,
@@ -277,7 +293,7 @@ fun SharedTaskCard(
         // 文字信息列：标题 + 描述 + 提醒时间。标题颜色和删除线由外层算好传入
         TaskTextContent(
             model = model,
-            isNotebook = isNotebook,
+            isNotebook = noteMode,
             titleColor = titleColor,
             strikeDraw = strikeDraw,
             modifier = Modifier.weight(1f),
@@ -488,8 +504,8 @@ private fun TaskTextContent(
                 )
             }
         }
-        // 描述：单行省略，仅在有内容时显示
-        // 笔记模式下去除 Markdown 语法符号再显示预览
+        // 描述：任务单行省略；笔记最多两行（7.3 允许笔记比任务多一行摘要，
+        // 因为笔记的价值在内容而不是元信息）。笔记模式下去除 Markdown 语法符号。
         val displayDesc = if (isNotebook) model.description?.let { stripMarkdown(it) } else model.description
         if (!displayDesc.isNullOrBlank()) {
             Spacer(modifier = Modifier.height(2.dp))
@@ -497,21 +513,23 @@ private fun TaskTextContent(
                 text = displayDesc,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
+                maxLines = if (isNotebook) 2 else 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        // 提醒时间显示行
+        // 提醒时间 / 预计时长显示行
         TaskReminderInfoRow(model = model)
     }
 }
 
 /**
- * 任务提醒信息行 —— 显示一次性提醒和/或每日循环提醒时间。
+ * 任务提醒信息行 —— 显示一次性提醒、每日循环提醒时间与预计时长。
  *
- * 显示规则：
- * - 每日循环任务：只显示时钟图标 + HH:MM，逾期时变红
- * - 一次性提醒任务：显示铃铛图标 + 完整日期时间，逾期时变红
+ * 显示规则（7.9）：
+ * - 有 reminder + 有预计时长 → 「14:00 开始 · 预计 45 分钟」（不是两行无关的元信息）
+ * - 只有预计时长 → 「预计 45 分钟」，不伪装成已安排
+ * - 每日循环任务只显示时钟 + HH:MM，逾期变红
+ * - 一次性提醒显示铃铛 + 完整日期时间，逾期变红
  * - 两者可同时显示（每日循环任务也可设置一次性提醒）
  *
  * @param model 任务卡片数据
@@ -525,7 +543,9 @@ private fun TaskReminderInfoRow(
     val hasReminder = !model.reminder.isNullOrBlank() && (!model.isDaily || !model.reminder.isReminderToday())
     // 每日任务的逾期判断：通过 reminder 字段（自动设为今天日期+时间）检测是否已过时
     val isDailyOverdue = model.isDaily && model.reminder.isReminderOverdue() && !model.isDone
-    if (hasReminder || hasReminderTime) {
+    // 预计时长单独成行时的文案；与 reminder 同时存在时合并到同一行
+    val minutesText = model.expectedMinutes?.let { "预计 $it 分钟" }
+    if (hasReminder || hasReminderTime || minutesText != null) {
         Spacer(modifier = Modifier.height(2.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             // 一次性提醒部分：铃铛图标 + 格式化的完整日期时间，逾期变红
@@ -570,6 +590,34 @@ private fun TaskReminderInfoRow(
                     style = MaterialTheme.typography.bodySmall,
                     color = if (isDailyOverdue) MaterialTheme.colorScheme.error
                     else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = NionAlpha.TEXT_SECONDARY),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            // 预计时长：与提醒同时存在时用「·」连接成一句，单独存在时自己成句。
+            // 只有时长、没有提醒时绝不显示成「已安排」，避免误导（7.9）。
+            if (minutesText != null) {
+                if (hasReminder || hasReminderTime) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        "·",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = NionAlpha.TEXT_SECONDARY),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                } else {
+                    Icon(
+                        LucideIcons.Timer,
+                        contentDescription = null,
+                        modifier = Modifier.size(12.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = NionAlpha.TEXT_SECONDARY),
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                }
+                Text(
+                    text = minutesText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = NionAlpha.TEXT_SECONDARY),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )

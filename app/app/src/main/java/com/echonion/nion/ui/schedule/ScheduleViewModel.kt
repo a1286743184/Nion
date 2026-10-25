@@ -47,6 +47,10 @@ data class ScheduleTaskItem(
     val reminderTime: String?,
     /** 一次性提醒时间，格式 "YYYY-MM-DDTHH:MM"，在卡片上以铃铛图标展示 */
     val reminder: String? = null,
+    /** 实体类型："task" 可勾选，"note" 笔记（日程里可显示但无勾选） */
+    val kind: String = "task",
+    /** 预计总工作量（分钟）；null = 未规划。日程条目用来显示预计占用 */
+    val expectedMinutes: Long? = null,
 )
 
 /**
@@ -362,6 +366,8 @@ class ScheduleViewModel(
             isDaily = isDaily,
             reminderTime = task.recurrenceReminderTime,
             reminder = task.reminder,
+            kind = task.kind,
+            expectedMinutes = task.expectedMinutes,
         )
     }
 }
@@ -376,6 +382,8 @@ fun ScheduleTaskItem.toCardModel(): TaskCardModel = TaskCardModel(
     isDaily = isDaily,
     reminderTime = reminderTime,
     reminder = reminder,
+    kind = kind,
+    expectedMinutes = expectedMinutes,
 )
 
 /** 将 ScheduleTaskItem 转为 TaskItem（字段从 DailyTaskStatus 派生得来，缺少 createdAt/focusSeconds） */

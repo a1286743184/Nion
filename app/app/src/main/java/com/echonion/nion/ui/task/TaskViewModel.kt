@@ -51,7 +51,25 @@ data class TaskItem(
     val isDaily: Boolean = false,
     /** 当前查看日期的完成状态。每日任务看 completions 表，普通任务看 status */
     val isCompletedForDate: Boolean = false,
-)
+    /**
+     * 实体类型："task"（可勾选）或 "note"（笔记）。
+     * B3 起外观由它决定，不再看所在清单是不是笔记型。
+     */
+    val kind: String = "task",
+    /** 预计总工作量（分钟）；null = 未规划。用于卡片「预计 N 分钟」与专注对比 */
+    val expectedMinutes: Long? = null,
+    /** 父级 ID；null = 顶层实体。用于详情返回栈与子项树 */
+    val parentId: String? = null,
+    /** 所属清单 ID；用于「移动清单」菜单显示当前值与跨清单跳转 */
+    val categoryId: String? = null,
+    /** 所属分组 ID；用于「更改分组」菜单显示当前值 */
+    val groupId: String? = null,
+    /** 关联实体 ID 原始串（逗号分隔）。UI 只用于计数，详情页走 core 查询拿完整数据 */
+    val linkedIds: String? = null,
+) {
+    /** 是否笔记实体（不可勾选、无完成态） */
+    val isNote: Boolean get() = kind == "note"
+}
 
 @Stable
 data class ChecklistItem(
@@ -154,6 +172,113 @@ class TaskViewModel(
 
     /** 当前是否在笔记型清单视图中 */
     val isNotebookView: Boolean by derivedStateOf { activeChecklistType == "notebook" }
+
+    /**
+     * 当前视图里各类实体的计数 —— 供顶部副标题与空态文案使用（7.4）。
+     *
+     * 口径：
+     * - 遍历全部子孙实体（不是只看顶层），否则父项展开/折叠会改变统计；
+     * - 笔记计数按实体 kind，不按清单类型 —— 任务型清单里的笔记也要算笔记；
+     * - 「已完成」只统计 task，笔记没有完成语义。
+     */
+    data class EntityCounts(
+        /** 未完成任务数 */
+        val todoTasks: Int,
+        /** 笔记数（含已完成状态中的笔记，笔记永远算「进行中」） */
+        val notes: Int,
+        /** 已完成任务数 */
+        val doneTasks: Int,
+    ) {
+        /** 进行中实体数 = 未完成任务 + 全部笔记 */
+        val active: Int get() = todoTasks + notes
+    }
+
+    /**
+     * 计算当前视图的实体计数。
+     *
+     * 说明：这里用 derivedStateOf 包住，避免每次重组都递归全表；
+     * 只在 tasks 变化时重算一次，列表项内不再做任何统计。
+     */
+    val entityCounts: EntityCounts by derivedStateOf {
+        var todo = 0
+        var notes = 0
+        var done = 0
+        fun walk(list: List<TaskItem>) {
+            for (item in list) {
+                if (item.isNote) {
+                    notes++
+                } else if (item.isDone || item.isCompletedForDate) {
+                    done++
+                } else {
+                    todo++
+                }
+                if (item.subtasks.isNotEmpty()) walk(item.subtasks)
+            }
+        }
+        walk(tasks)
+        EntityCounts(todoTasks = todo, notes = notes, doneTasks = done)
+    }
+
+    /**
+     * 顶部副标题文案（7.4 定稿表格）。
+     *
+     * 规则：省略为 0 的部分；混合语境始终带单位，避免「3 项」看不出是任务还是笔记。
+     */
+    val statsSubtitle: String
+        get() {
+            val c = entityCounts
+            return when (activeChecklistId) {
+                TODAY_ID -> when {
+                    c.todoTasks > 0 && c.notes > 0 -> "今天还有 ${c.todoTasks} 项待办 · ${c.notes} 条笔记"
+                    c.todoTasks > 0 -> "今天还有 ${c.todoTasks} 项待办"
+                    c.notes > 0 -> "今天有 ${c.notes} 条笔记"
+                    c.doneTasks > 0 -> "今天已全部完成，共 ${c.doneTasks} 项"
+                    else -> "今天没有安排"
+                }
+                INBOX_ID -> when {
+                    c.todoTasks > 0 && c.notes > 0 -> "${c.todoTasks} 项待整理 · ${c.notes} 条笔记"
+                    c.todoTasks > 0 -> "${c.todoTasks} 项待整理"
+                    c.notes > 0 -> "${c.notes} 条笔记"
+                    else -> "收集箱是空的"
+                }
+                else -> {
+                    // 自建清单：三明治式组合，省略为 0 的部分
+                    val parts = buildList {
+                        if (c.todoTasks > 0) add("${c.todoTasks} 项待办")
+                        if (c.notes > 0) add("${c.notes} 条笔记")
+                        if (c.doneTasks > 0) add("${c.doneTasks} 项已完成")
+                    }
+                    when {
+                        parts.isEmpty() -> "暂无内容"
+                        // 全部完成且没有待办/笔记时，换成「全部完成，共 N 项」更贴切
+                        c.todoTasks == 0 && c.notes == 0 -> "全部完成，共 ${c.doneTasks} 项"
+                        else -> parts.joinToString(" · ")
+                    }
+                }
+            }
+        }
+
+    /**
+     * 空态文案三元组（标题 / 辅助文案 / 主操作提示），按 7.4 表格逐场景给出。
+     *
+     * @return Triple(空态标题, 空态辅助文案, 主操作提示)
+     */
+    val emptyStateText: Triple<String, String, String>
+        get() {
+            val c = entityCounts
+            return when (activeChecklistId) {
+                TODAY_ID -> Triple("今天没有安排", "留一点空白", "或点击 + 添加任务")
+                INBOX_ID -> Triple("收集箱是空的", "", "点击 + 记录一个想法")
+                else -> when {
+                    // 笔记型清单且只有笔记 → 「还没有笔记」
+                    c.notes > 0 -> Triple("从一件小事开始", "", "点击 + 新建任务或笔记")
+                    isNotebookView -> Triple("还没有笔记", "", "点击 + 写下第一条笔记")
+                    // 混合或任务型清单
+                    activeChecklistType == "notebook" -> Triple("从一件小事开始", "", "点击 + 新建任务或笔记")
+                    else -> Triple("还没有任务", "", "点击 + 添加第一个任务")
+                }
+            }
+        }
 
     private var countsJob: Job? = null
 
@@ -357,6 +482,77 @@ class TaskViewModel(
                 tasks = loadedTasks
             } catch (e: Exception) {
                 onError("切换分组失败: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 创建实体（任务或笔记），由 kind 决定类型（7.6 单 FAB + 类型选择器）。
+     *
+     * 与旧 createTask/createNote 的区别：
+     * - 类型显式传入，不再由「当前清单是不是笔记型」推导；
+     * - 支持 expected_minutes（预计时长）；
+     * - 笔记创建后由调用方打开编辑器，任务创建后回列表。
+     *
+     * @param kind        "task" 或 "note"
+     * @param name        标题
+     * @param description 任务描述 / 笔记正文
+     * @param priority    优先级（笔记忽略，固定 medium）
+     * @param expectedMinutes 预计总工作量（分钟），null = 未规划
+     * @param recurrenceRule 循环规则（笔记忽略）
+     * @param recurrenceReminderTime 循环提醒时间（笔记忽略）
+     * @param reminder    一次性提醒时间（笔记忽略）
+     * @param onCreated   创建成功回调，传入新实体 ID
+     */
+    fun createEntity(
+        kind: String,
+        name: String,
+        description: String?,
+        priority: String,
+        expectedMinutes: Long? = null,
+        recurrenceRule: String? = null,
+        recurrenceReminderTime: String? = null,
+        reminder: String? = null,
+        onCreated: ((String) -> Unit) = {},
+    ) {
+        viewModelScope.launch {
+            try {
+                // "今天"和"收集箱"不是真实清单，创建时 category_id 设为 null
+                val realCategoryId = when (activeChecklistId) {
+                    TODAY_ID, INBOX_ID -> null
+                    else -> activeChecklistId
+                }
+                // 在"今天"视图中创建任务时，若未指定 reminder，自动设为今天日期，
+                // 否则新任务不会出现在当前列表里（用户会以为没创建成功）。
+                // 笔记不参与时间视图，不做这个兜底。
+                val isTask = kind != "note"
+                val finalReminder = if (isTask && reminder == null && activeChecklistId == TODAY_ID) {
+                    java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE)
+                } else {
+                    reminder
+                }
+                val created = withContext(Dispatchers.IO) {
+                    core.createTaskEx(
+                        name = name,
+                        description = description,
+                        priority = if (isTask) priority else "medium",
+                        categoryId = realCategoryId,
+                        parentId = null,
+                        groupId = activeGroupId,
+                        recurrenceRule = if (isTask) recurrenceRule else null,
+                        recurrenceReminderTime = if (isTask) recurrenceReminderTime else null,
+                        reminder = finalReminder,
+                        kind = kind,
+                        expectedMinutes = expectedMinutes,
+                    )
+                }
+                // 只有任务需要调度提醒闹钟
+                if (isTask) scheduleReminderIfNeeded(created)
+                tasks = loadTasksForCurrentView()
+                scheduleRefreshCounts()
+                onCreated(created.id)
+            } catch (e: Exception) {
+                onError("创建失败: ${e.message}")
             }
         }
     }

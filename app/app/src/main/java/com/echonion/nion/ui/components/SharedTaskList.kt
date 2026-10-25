@@ -247,8 +247,17 @@ fun SharedTaskList(
                 Box(modifier = Modifier.animateItem(
                     placementSpec = spring(dampingRatio = 1.0f, stiffness = Spring.StiffnessMediumLow),
                 )) {
-                    // 笔记模式下 section header 显示"笔记"，任务模式显示"待办"
-                    SectionHeader(if (isNotebook) "笔记" else "待办", reorderableItems.count { it.depth == 0 })
+                    // 分区标题按数据实际构成决定（7.4）：
+                    // 纯笔记 → 「笔记」，纯任务 → 「待办」，混合 → 「进行中」。
+                    // 不再用 isNotebook（清单语境）单方面决定，否则混排时会误导。
+                    val hasTask = reorderableItems.any { !it.task.isNote }
+                    val hasNote = reorderableItems.any { it.task.isNote }
+                    val headerLabel = when {
+                        hasTask && hasNote -> "进行中"
+                        hasNote -> "笔记"
+                        else -> "待办"
+                    }
+                    SectionHeader(headerLabel, reorderableItems.count { it.depth == 0 })
                 }
             }
 
@@ -435,7 +444,8 @@ fun SharedTaskList(
                                 isGroupSelected = groupSelected,
                                 onToggleCollapse = onToggleCollapse,
                                 sharedElementModifier = taskSharedModifier(flatItem.task.id),
-                                isNotebook = isNotebook,
+                                // 不传 isNotebook：外观由 flatItem.task.kind 决定（B3）
+                                isNotebook = false,
                                 // 完成动画参数透传：根据 task.id 是否在各集合中决定该任务的动画行为。
                                 // visualDone 覆盖：动画中的任务 UI 呈现已完成（但 model.isDone 还是 false）
                                 playCompletionAnim = flatItem.task.id in playCompletionAnimIds,
@@ -450,8 +460,9 @@ fun SharedTaskList(
             }
         }
 
-        // 笔记模式不显示"已完成"区（笔记没有完成状态）
-        if (doneItems.isNotEmpty() && !isNotebook) {
+        // 已完成区只含 task（笔记没有完成语义，不会进 doneItems）。
+        // 是否渲染由数据决定，不再看清单类型 —— 混排清单里有已完成任务时也要显示。
+        if (doneItems.isNotEmpty()) {
             item(key = "done_header", contentType = "header") {
                 Box(modifier = Modifier.animateItem(
                     placementSpec = spring(dampingRatio = 1.0f, stiffness = Spring.StiffnessMediumLow),
@@ -499,7 +510,8 @@ fun SharedTaskList(
                         isSelected = isSelected,
                         isGroupSelected = isSelected,
                         sharedElementModifier = taskSharedModifier(flatItem.task.id),
-                        isNotebook = isNotebook,
+                        // 已完成区只含 task，外观按实体 kind（此处恒为 task）
+                        isNotebook = false,
                         // done 区通常无完成动画（动画结束后任务才进 done 区），但保持透传逻辑一致
                         playCompletionAnim = flatItem.task.id in playCompletionAnimIds,
                         visualDone = if (flatItem.task.id in playCompletionAnimIds) true else null,

@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -50,6 +51,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -62,6 +64,7 @@ import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -414,11 +417,10 @@ fun TaskScreen(
                                 ) {
                                     FloatingActionButton(
                                         onClick = {
-                                            if (viewModel.isNotebookView) {
-                                                showAddNote = true
-                                            } else {
-                                                showAddSheet = true
-                                            }
+                                            // 单一入口（7.6）：一律打开统一表单，
+                                            // 默认类型由清单语境决定（笔记型清单默认笔记），
+                                            // 用户在表单里可随时切换，不需要认识两套按钮
+                                            showAddSheet = true
                                         },
                                         modifier = Modifier.sharedBounds(
                                             sharedContentState = rememberSharedContentState("fab"),
@@ -449,19 +451,25 @@ fun TaskScreen(
                     ) {
                         AddTaskOverlay(
                             onDismiss = { showAddSheet = false },
-                            onAdd = { title, desc, priority, recurrenceRule, recurrenceReminderTime, reminder ->
+                            // 默认类型由清单语境给出：笔记型清单默认 note，其余（含智能清单）默认 task
+                            initialKind = if (viewModel.isNotebookView) "note" else "task",
+                            onAdd = { kind, title, desc, priority, recRule, recTime, reminder, minutes ->
                                 val pending = pendingAttachmentData.toList()
-                                viewModel.createTask(
+                                viewModel.createEntity(
+                                    kind = kind,
                                     name = title,
                                     description = desc,
                                     priority = priority,
-                                    recurrenceRule = recurrenceRule,
-                                    recurrenceReminderTime = recurrenceReminderTime,
+                                    expectedMinutes = minutes,
+                                    recurrenceRule = recRule,
+                                    recurrenceReminderTime = recTime,
                                     reminder = reminder,
-                                ) { newTaskId ->
+                                ) { newId ->
                                     if (pending.isNotEmpty()) {
-                                        viewModel.commitPendingAttachments(newTaskId, pending)
+                                        viewModel.commitPendingAttachments(newId, pending)
                                     }
+                                    // 笔记创建成功后直接打开编辑器（7.6）；任务回列表
+                                    if (kind == "note") expandedTaskId = newId
                                 }
                                 showAddSheet = false
                             },
@@ -655,7 +663,9 @@ private fun TaskScreenContent(
                         Column {
                             Text(viewModel.activeChecklistName, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                             Text(
-                                "${viewModel.todoCount}项待办 · ${viewModel.doneCount}项已完成",
+                                // 统计口径见 TaskViewModel.statsSubtitle（7.4）：
+                                // 含全部子孙实体、笔记按 kind 计数、已完成只含任务
+                                viewModel.statsSubtitle,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -696,7 +706,16 @@ private fun TaskScreenContent(
                     )
                 }
                 if (viewModel.tasks.isEmpty()) {
-                    EmptyTaskView(modifier = Modifier.weight(1f))
+                    // 空态文案按场景提供（纯任务/纯笔记/混合/今天/收集箱各不相同）
+                    val (emptyTitle, emptyHint, emptyAction) = viewModel.emptyStateText
+                    EmptyTaskView(
+                        modifier = Modifier.weight(1f),
+                        title = emptyTitle,
+                        hint = emptyHint,
+                        actionHint = emptyAction,
+                        // 笔记型语境用文档图标，其余用对勾圆
+                        icon = if (viewModel.isNotebookView) LucideIcons.FileText else LucideIcons.CircleCheck,
+                    )
                 } else {
                     SharedTaskList(
                         todoItems = viewModel.flatTodoTasks,
@@ -796,6 +815,249 @@ private fun ReminderEntryRow(
  * - RECURRENCE：重复设置面板（不重复/每天 + 时间滚轮）
  */
 private enum class AddPanel { FORM, REMINDER, RECURRENCE }
+
+/**
+ * 实体类型双段选择器 —— 「任务 / 笔记」（7.6 U-01）。
+ *
+ * 设计要求：图标与文字同时变化，不能只换颜色（颜色不是唯一状态信号）；
+ * 高度 40dp，选中项用 secondaryContainer 填充，触摸区不小于 48dp。
+ *
+ * @param kind         当前类型："task" / "note"
+ * @param onKindChange 用户切换类型时触发，回调新类型
+ */
+@Composable
+private fun EntityKindSelector(
+    kind: String,
+    onKindChange: (String) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        // 两个分段共用同一渲染逻辑，只有图标/文案/目标值不同
+        listOf(
+            Triple("task", "任务", LucideIcons.CircleCheck),
+            Triple("note", "笔记", LucideIcons.FileText),
+        ).forEach { (value, label, icon) ->
+            val selected = kind == value
+            Surface(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(40.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = { onKindChange(value) },
+                    ),
+                shape = RoundedCornerShape(10.dp),
+                // 选中态用 secondaryContainer，未选中保持容器底色（颜色过渡自然，不闪黑）
+                color = if (selected) MaterialTheme.colorScheme.secondaryContainer
+                else MaterialTheme.colorScheme.surfaceContainerHighest,
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        icon,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = if (selected) MaterialTheme.colorScheme.onSecondaryContainer
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                        color = if (selected) MaterialTheme.colorScheme.onSecondaryContainer
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 预计时长入口行 —— 显示当前预计总工作量，点击打开快捷选择抽屉（7.9）。
+ *
+ * expected_minutes 是「预计总工作量」，不是强制计时长度，也不产生结束时间字段。
+ *
+ * @param minutes         当前预计分钟数，null = 未设置
+ * @param onMinutesChange 选择/清除时回调；null 表示清除
+ */
+@Composable
+private fun ExpectedMinutesRow(
+    minutes: Long?,
+    onMinutesChange: (Long?) -> Unit,
+) {
+    var showSheet by remember { mutableStateOf(false) }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = { showSheet = true },
+            )
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            LucideIcons.Timer,
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+            tint = if (minutes != null) MaterialTheme.colorScheme.secondary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            "预计时长",
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.weight(1f))
+        Text(
+            text = minutes?.let { "$it 分钟" } ?: "未设置",
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = if (minutes != null) MaterialTheme.colorScheme.secondary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+
+    if (showSheet) {
+        ExpectedMinutesSheet(
+            current = minutes,
+            onConfirm = {
+                onMinutesChange(it)
+                showSheet = false
+            },
+            onDismiss = { showSheet = false },
+        )
+    }
+}
+
+/**
+ * 预计时长选择抽屉 —— 15/25/45/60/90 快捷选项 + 自定义正整数 + 清除（7.9）。
+ *
+ * 校验：只接受正整数；0、负数、非数字都禁止保存（按钮置灰并给出提示）。
+ *
+ * @param current   当前值，null = 未设置
+ * @param onConfirm 确认回调；传 null 表示清除
+ * @param onDismiss 关闭回调
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ExpectedMinutesSheet(
+    current: Long?,
+    onConfirm: (Long?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    // 选中的值：null 表示「未设置」，与「清除」等价
+    var selected by remember { mutableStateOf(current) }
+    // 自定义输入框的文本；非空且合法时优先于快捷选项
+    var customText by remember { mutableStateOf("") }
+    val customValue = customText.trim().toLongOrNull()
+    // 自定义输入非法（有输入但不是正整数）时禁止保存
+    val customInvalid = customText.isNotBlank() && (customValue == null || customValue <= 0)
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text(
+                "预计时长",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                "这是预计总工作量，不会限制你的专注计时。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            // 快捷选项：两行流式排布，触摸区高度 40dp + 外层间距补足 48dp
+            androidx.compose.foundation.layout.FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                listOf(15L, 25L, 45L, 60L, 90L).forEach { preset ->
+                    val isSelected = customText.isBlank() && selected == preset
+                    Surface(
+                        modifier = Modifier
+                            .height(40.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                                onClick = {
+                                    selected = preset
+                                    customText = ""
+                                },
+                            ),
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (isSelected) MaterialTheme.colorScheme.secondaryContainer
+                        else MaterialTheme.colorScheme.surfaceContainerHigh,
+                    ) {
+                        Box(
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                "$preset 分钟",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = if (isSelected) MaterialTheme.colorScheme.onSecondaryContainer
+                                else MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+                    }
+                }
+            }
+            OutlinedTextField(
+                value = customText,
+                onValueChange = { input ->
+                    // 只允许数字，避免用户输入字母后拿到莫名其妙的错误
+                    customText = input.filter { it.isDigit() }.take(4)
+                },
+                label = { Text("自定义（分钟）") },
+                isError = customInvalid,
+                supportingText = if (customInvalid) {
+                    { Text("请输入大于 0 的整数分钟") }
+                } else null,
+                singleLine = true,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = { onConfirm(customValue ?: selected) },
+                enabled = !customInvalid,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+            ) { Text("保存") }
+            // 清除入口：与保存分开，避免误把「保存空值」当成清除
+            TextButton(
+                onClick = { onConfirm(null) },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("清除") }
+        }
+    }
+}
 
 /**
  * 新建笔记浮层 —— 从 FAB 位置 morph 展开为居中的笔记创建表单。
@@ -917,26 +1179,34 @@ private fun AddNoteOverlay(
 }
 
 /**
- * 新建任务浮层 —— 从 FAB 位置 morph 展开为居中的任务创建表单。
+ * 新建实体浮层 —— 任务与笔记共用一个表单（7.6 单 FAB + 类型选择器）。
  *
- * 内部使用 AnimatedContent 在三个面板之间切换（FORM / REMINDER / RECURRENCE），
- * 左右滑动动画实现面板间的视觉过渡。
+ * 为什么合一：旧实现有 AddTaskOverlay 与 AddNoteOverlay 两套表单，用户在笔记型清单
+ * 里建不了任务、在任务型清单里建不了笔记，且切换类型等于重开表单、草稿全丢。
+ * 现在只有一个草稿与一个类型开关：
+ * - 「任务 / 笔记」双段选择器默认值由清单语境给出（笔记型清单默认笔记）；
+ * - 切换类型只隐藏/显示字段，不清空任何已输入内容；
+ * - 笔记态展示标题 + Markdown 正文 + 附件；任务态额外展示优先级、提醒、重复、预计时长。
  *
- * @param onDismiss 点击外部区域关闭回调
- * @param onAdd 确认添加回调，传入 (标题, 描述, 优先级, 循环规则, 提醒时间, 一次性提醒)
+ * @param onDismiss            关闭回调（已有输入时应由调用方确认是否放弃）
+ * @param onAdd                提交回调，传入 (kind, 标题, 描述/正文, 优先级, 循环规则,
+ *                             循环提醒时间, 一次性提醒, 预计时长)
  * @param sharedBoundsModifier shared element 动画 modifier（与 FAB 共享 bounds）
- * @param pendingAttachments 当前暂存的附件列表
- * @param onPickImage 点击添加图片附件时触发
- * @param onPickFile 点击添加文件附件时触发
- * @param onRemoveAttachment 移除暂存附件时触发
- * @param onPreviewImage 预览图片附件时触发
+ * @param initialKind          打开时的默认类型（"task" / "note"）
+ * @param pendingAttachments   当前暂存的附件列表
+ * @param onPickImage          点击添加图片附件
+ * @param onPickFile           点击添加文件附件
+ * @param onRemoveAttachment   移除暂存附件
+ * @param onPreviewImage       预览图片附件
  */
 @Composable
 private fun AddTaskOverlay(
     onDismiss: () -> Unit,
-    /** 创建回调：title, description, priority, recurrenceRule, recurrenceReminderTime, reminder */
-    onAdd: (String, String?, String, String?, String?, String?) -> Unit,
+    /** 创建回调：kind, title, description, priority, recurrenceRule, recurrenceReminderTime, reminder, expectedMinutes */
+    onAdd: (String, String, String?, String, String?, String?, String?, Long?) -> Unit,
     sharedBoundsModifier: Modifier,
+    /** 打开时的默认类型：任务型清单/智能清单默认 task，笔记型清单默认 note */
+    initialKind: String = "task",
     /** 当前暂存的附件列表 */
     pendingAttachments: List<AttachmentUiItem> = emptyList(),
     /** 点击添加图片附件时触发 */
@@ -957,8 +1227,13 @@ private fun AddTaskOverlay(
     var recurrenceReminderTime by remember { mutableStateOf<String?>(null) }
     // 一次性提醒时间：YYYY-MM-DDTHH:MM 格式，null 表示未设置
     var taskReminder by remember { mutableStateOf<String?>(null) }
+    // 预计总工作量（分钟），null = 未规划
+    var expectedMinutes by remember { mutableStateOf<Long?>(null) }
     // 当前面板状态，默认为 FORM 主表单
     var panel by remember { mutableStateOf(AddPanel.FORM) }
+    // 当前实体类型：切换只改变可见字段，不重置上面任何草稿（7.6 明确要求）
+    var kind by remember { mutableStateOf(if (initialKind == "note") "note" else "task") }
+    val isNote = kind == "note"
 
     // 自动聚焦标题输入框，仅在首次展示 FORM 面板时呼出键盘
     // 从设置重复/提醒等子面板返回时不会重复聚焦
@@ -970,6 +1245,9 @@ private fun AddTaskOverlay(
             hasAutoFocused = true
         }
     }
+
+    // 空标题或纯空白不视为有效标题（7.6）
+    val canSubmit = title.isNotBlank()
 
     // 半透明背景 + 点击外部关闭
     Box(
@@ -1020,21 +1298,26 @@ private fun AddTaskOverlay(
                 when (currentPanel) {
                     AddPanel.FORM -> {
                         // ===== 主表单面板 =====
+                        // 外层 verticalScroll：大字体/窄屏时表单可滚动，
+                        // 保证提交按钮不会被 IME 或屏幕边缘裁掉
                         Column(
-                            modifier = Modifier.padding(20.dp),
-                            verticalArrangement = Arrangement.spacedBy(20.dp),
+                            modifier = Modifier
+                                .padding(20.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
                         ) {
-                            // 标题：纯文字，无图标
+                            // ── 类型双段选择器（U-01）：图标与文字同时变化，不只换色 ──
+                            EntityKindSelector(kind = kind, onKindChange = { kind = it })
                             Text(
-                                "新建任务",
+                                if (isNote) "新建笔记" else "新建任务",
                                 style = MaterialTheme.typography.headlineMedium,
                                 fontWeight = FontWeight.Bold,
                             )
-                            // 标题输入框：粗线边框，自动聚焦呼出输入法
+                            // 标题输入框：粗线边框，自动聚焦；提示语随类型变化
                             OutlinedTextField(
                                 value = title,
                                 onValueChange = { title = it },
-                                placeholder = { Text("标题") },
+                                placeholder = { Text(if (isNote) "想记点什么？" else "要做点什么？") },
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .border(3.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(14.dp))
@@ -1048,7 +1331,7 @@ private fun AddTaskOverlay(
                                 ),
                                 singleLine = true,
                             )
-                            // 描述输入框：粗线边框，右下角内嵌附件按钮，clip 防止附件按钮展开时溢出框外
+                            // 描述/正文输入框：右下角内嵌附件按钮，clip 防溢出
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1057,7 +1340,7 @@ private fun AddTaskOverlay(
                                 OutlinedTextField(
                                     value = description,
                                     onValueChange = { description = it },
-                                    placeholder = { Text("描述") },
+                                    placeholder = { Text(if (isNote) "正文（支持 Markdown）" else "描述") },
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .border(3.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(14.dp)),
@@ -1068,9 +1351,10 @@ private fun AddTaskOverlay(
                                         focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
                                         unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                                     ),
-                                    maxLines = 3,
+                                    // 笔记正文是主体内容，给更高行数
+                                    maxLines = if (isNote) 12 else 3,
                                 )
-                                // 附件按钮：定位在描述输入框的右下角
+                                // 附件按钮：定位在输入框右下角
                                 AttachmentButton(
                                     onPickImage = onPickImage,
                                     onPickFile = onPickFile,
@@ -1079,28 +1363,37 @@ private fun AddTaskOverlay(
                                         .padding(end = 4.dp, bottom = 4.dp),
                                 )
                             }
-                            // 优先级选择
-                            Text(
-                                "优先级",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            PrioritySelector(selected = priority, onSelect = { priority = it })
 
-                            // 提醒入口行：显示当前提醒时间，点击切换到 REMINDER 面板
-                            ReminderEntryRow(
-                                reminder = taskReminder,
-                                onClick = { panel = AddPanel.REMINDER },
-                            )
+                            // ── 任务专属字段：笔记态整体隐藏，但 state 保留（切回任务时恢复）──
+                            if (!isNote) {
+                                Text(
+                                    "优先级",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                PrioritySelector(selected = priority, onSelect = { priority = it })
 
-                            // 重复入口行：显示当前循环设置，点击切换到 RECURRENCE 面板
-                            RecurrenceEntryRow(
-                                recurrenceRule = recurrenceRule,
-                                reminderTime = recurrenceReminderTime,
-                                onClick = { panel = AddPanel.RECURRENCE },
-                            )
+                                // 提醒入口行：显示当前提醒时间，点击切换到 REMINDER 面板
+                                ReminderEntryRow(
+                                    reminder = taskReminder,
+                                    onClick = { panel = AddPanel.REMINDER },
+                                )
 
-                            // 已暂存的附件缩略图列表
+                                // 重复入口行：显示当前循环设置，点击切换到 RECURRENCE 面板
+                                RecurrenceEntryRow(
+                                    recurrenceRule = recurrenceRule,
+                                    reminderTime = recurrenceReminderTime,
+                                    onClick = { panel = AddPanel.RECURRENCE },
+                                )
+
+                                // 预计时长：快捷选项 + 自定义 + 清除（7.9）
+                                ExpectedMinutesRow(
+                                    minutes = expectedMinutes,
+                                    onMinutesChange = { expectedMinutes = it },
+                                )
+                            }
+
+                            // 已暂存的附件缩略图列表（两种类型共用）
                             if (pendingAttachments.isNotEmpty()) {
                                 AttachmentList(
                                     attachments = pendingAttachments,
@@ -1122,20 +1415,27 @@ private fun AddTaskOverlay(
                                 ) { Text("取消", fontWeight = FontWeight.SemiBold) }
                                 Button(
                                     onClick = {
-                                        if (title.isNotBlank()) onAdd(
+                                        if (canSubmit) onAdd(
+                                            kind,
                                             title.trim(),
                                             description.trim().ifBlank { null },
                                             priority,
                                             recurrenceRule,
                                             recurrenceReminderTime,
-                                            taskReminder
+                                            taskReminder,
+                                            expectedMinutes,
                                         )
                                     },
-                                    enabled = title.isNotBlank(),
+                                    enabled = canSubmit,
                                     shape = RoundedCornerShape(14.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                                     modifier = Modifier.weight(1f),
-                                ) { Text("添加", fontWeight = FontWeight.SemiBold) }
+                                ) {
+                                    Text(
+                                        if (isNote) "添加笔记" else "添加任务",
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                }
                             }
                         }
                     }
@@ -1385,13 +1685,61 @@ private fun AdaptiveHeightLayout(
     }
 }
 
+/**
+ * 空态视图 —— 细线图标 + 标题 + 辅助文案三行结构（7.4）。
+ *
+ * 不使用大面积插画；垂直居中并保留底部 FAB 的安全空间。
+ * 文案由 ViewModel 按场景给出（纯任务 / 纯笔记 / 混合 / 今天 / 收集箱各不相同）。
+ *
+ * @param title       空态标题，如「还没有任务」
+ * @param hint        辅助文案，可为空（为空时不渲染该行，不留空白）
+ * @param actionHint  主操作提示，如「点击 + 添加第一个任务」
+ * @param icon        细线图标，任务型用 CircleCheck，笔记型用 FileText
+ */
 @Composable
-private fun EmptyTaskView(modifier: Modifier = Modifier) {
-    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("暂无任务", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-            Spacer(modifier = Modifier.height(8.dp))
-            Text("点击 + 添加第一个任务", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun EmptyTaskView(
+    modifier: Modifier = Modifier,
+    title: String = "还没有任务",
+    hint: String = "",
+    actionHint: String = "点击 + 添加第一个任务",
+    icon: androidx.compose.ui.graphics.vector.ImageVector = LucideIcons.CircleCheck,
+) {
+    Box(
+        modifier = modifier.fillMaxSize(),
+        // 底部留出 FAB 高度，避免提示文案被悬浮按钮压住
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(bottom = 72.dp),
+        ) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = NionAlpha.TEXT_SUBTITLE),
+                modifier = Modifier.size(24.dp),
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                title,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (hint.isNotBlank()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    hint,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                actionHint,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = NionAlpha.TEXT_MEDIUM),
+            )
         }
     }
 }
