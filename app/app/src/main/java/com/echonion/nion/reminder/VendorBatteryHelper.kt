@@ -24,6 +24,34 @@ object VendorBatteryHelper {
     private const val TAG = "VendorBatteryHelper"
 
     /**
+     * 当前设备是否有已知的厂商后台管控层。
+     *
+     * 只用于决定设置页是否展示「厂商后台运行」引导区块 —— 不承诺能读到
+     * 厂商内部开关的真实状态（多数 ROM 没有可查询的公开接口）。
+     */
+    fun hasVendorLayer(): Boolean = getVendorIntents().isNotEmpty()
+
+    /**
+     * 当前设备的厂商显示名（用于引导文案「请在 ⋯ 的系统设置中确认」）。
+     * 无已知厂商时返回 null，调用方据此隐藏厂商区块。
+     */
+    fun vendorDisplayName(): String? {
+        val manufacturer = Build.MANUFACTURER.lowercase()
+        val brand = Build.BRAND.lowercase()
+        return when {
+            manufacturer.contains("vivo") || brand.contains("iqoo") -> "vivo / iQOO"
+            manufacturer.contains("xiaomi") || brand.contains("redmi") || brand.contains("poco") -> "小米 / Redmi"
+            manufacturer.contains("huawei") || brand.contains("honor") -> "华为 / 荣耀"
+            manufacturer.contains("oppo") || brand.contains("realme") || brand.contains("oneplus") ->
+                "OPPO / realme / 一加"
+            manufacturer.contains("samsung") -> "三星"
+            manufacturer.contains("meizu") -> "魅族"
+            manufacturer.contains("asus") -> "华硕"
+            else -> null
+        }
+    }
+
+    /**
      * 打开当前设备最适合的电池 / 后台管理设置页。
      *
      * 优先级链：

@@ -15,6 +15,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- 震动权限：悬浮窗提醒/专注完成时震动反馈 -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 全屏提醒能力（Android 14+ 需用户在系统设置中单独允许）：
+         高优任务在息屏/锁屏时用 fullScreenIntent 唤亮独立提醒页。
+         未获允许时 NotificationHelper 会自动降级为 HIGH 通知 + heads-up，不阻断提醒。 -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <!-- 位置权限：天气功能需要 GPS 定位获取用户所在城市 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <!-- 音乐模块：Android 13+ 细化的音频读取权限，扫描本机音乐 -->
@@ -59,6 +63,19 @@
         <receiver
             android:name=".reminder.ReminderReceiver"
             android:exported="false" />
+
+        <!-- 高优提醒全屏页（fullScreenIntent 宿主）：息屏/锁屏时直接唤亮，
+             不经过聊天页。excludeFromRecents + noHistory 保证它不会留在任务栈里，
+             也不会因为用户切走又切回而重复出现。 -->
+        <activity
+            android:name=".reminder.ReminderFullscreenActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:noHistory="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/Theme.Nion" />
 
         <!-- 通知栏 Action 按钮点击接收器，处理「开始做了/知道了/等5分钟/今天算了」 -->
         <receiver

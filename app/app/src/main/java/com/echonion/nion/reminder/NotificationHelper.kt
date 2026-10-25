@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import com.echonion.nion.MainActivity
 import com.echonion.nion.R
@@ -36,6 +37,90 @@ object NotificationHelper {
     private const val WEATHER_CHANNEL_NAME = "天气预警"
     /** 天气预警渠道描述 */
     private const val WEATHER_CHANNEL_DESC = "Nion 的天气变化提醒"
+
+    // ── Intent extras（通知 → Activity 的约定键，避免各处硬编码字符串漂移）──
+    /** 任务 ID */
+    const val EXTRA_REMINDER_TASK_ID = "reminder_task_id"
+    /** 任务标题（全屏页显示用） */
+    const val EXTRA_REMINDER_TASK_TITLE = "reminder_task_title"
+    /** 已清理 Markdown 的提醒文案（全屏页显示用） */
+    const val EXTRA_REMINDER_MESSAGE = "reminder_message"
+    /** 当前触发次数 */
+    const val EXTRA_REMINDER_TRIGGER_COUNT = "reminder_trigger_count"
+    /** 标记「点击通知主体打开实体详情」（区别于 open_companion 展开聊天面板） */
+    const val EXTRA_OPEN_ENTITY = "open_entity"
+
+    /**
+     * 检查系统是否允许本应用使用全屏提醒（fullScreenIntent）。
+     *
+     * Android 14（API 34）起 `USE_FULL_SCREEN_INTENT` 变成需要用户授予的权限；
+     * 未获允许时调用 setFullScreenIntent 只会在通知栏显示、不会唤亮全屏页。
+     * 这里如实查询能力，供调用方决定「是否附加全屏 Intent」与「设置页如何提示」，
+     * 不假设所有 ROM 都能全屏唤亮。
+     *
+     * @return true 表示可以请求全屏；低版本或无法判断时按可用处理
+     */
+    fun canUseFullScreenIntent(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return true
+        return try {
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.canUseFullScreenIntent()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 系统通知总开关是否打开（用户可能只在系统设置里关掉本应用通知，
+     * 而没有撤销 POST_NOTIFICATIONS 运行时权限）。
+     */
+    fun areNotificationsEnabled(context: Context): Boolean {
+        return try {
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.areNotificationsEnabled()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 打开本应用的通知设置页（通知权限被拒时的首选修复入口）。
+     */
+    fun openNotificationSettings(context: Context) {
+        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+            putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching { context.startActivity(intent) }
+            .onFailure { openAppDetailsSettings(context) }
+    }
+
+    /**
+     * 打开本应用的全屏提醒权限设置页（Android 14+ 需要用户在系统里单独允许）。
+     */
+    fun openFullScreenIntentSettings(context: Context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val intent = Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT).apply {
+                data = android.net.Uri.parse("package:${context.packageName}")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (runCatching { context.startActivity(intent) }.isSuccess) return
+        }
+        // 低版本或跳转失败：退回应用详情页，用户仍可点进通知分类
+        openAppDetailsSettings(context)
+    }
+
+    /** 打开本应用详情页（最后兜底） */
+    private fun openAppDetailsSettings(context: Context) {
+        runCatching {
+            context.startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.parse("package:${context.packageName}"),
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+    }
 
     /** "正在输入"状态通知渠道 ID —— IMPORTANCE_MIN 确保无声无震动无横幅 */
     private const val TYPING_CHANNEL_ID = "typing_status"
@@ -119,11 +204,16 @@ object NotificationHelper {
      * - triggerCount 4：知道了 / 真的不做了
      * - triggerCount 5：知道了（仅一个按钮）
      *
+     * 高优任务在系统允许时附加 fullScreenIntent（息屏/锁屏直接唤亮全屏提醒页），
+     * 普通任务只发 HIGH 通知不申请全屏打断；全屏能力被拒绝时自动退化为普通 HIGH 通知。
+     *
      * @param context 上下文
      * @param taskId 任务 ID，同时用作通知 ID（通过 hashCode）
      * @param taskTitle 任务标题，用于 Action 按钮 Intent 传递
      * @param message Nion 的提醒文案（LLM 生成或模板），系统通知不支持 Markdown，会自动清理
      * @param triggerCount 当前触发次数（1-5），决定按钮文案
+     * @param taskPriority 任务优先级，仅 "high" 才考虑全屏提醒（7.13 定稿）
+     * @param allowFullScreenIntent 系统是否授予全屏提醒能力；false 时降级为 HIGH 通知
      */
     fun showReminderNotification(
         context: Context,
@@ -131,17 +221,21 @@ object NotificationHelper {
         taskTitle: String,
         message: String,
         triggerCount: Int,
+        taskPriority: String = "medium",
+        allowFullScreenIntent: Boolean = false,
     ) {
         // 系统通知不支持 Markdown 渲染，清理后显示纯文本
         val plainMessage = ReminderUtils.stripMarkdown(message)
         val notificationId = taskId.hashCode() and 0x7FFFFFFF
         val labels = ReminderMessageGenerator.getActionLabels(triggerCount)
 
-        // 点击通知主体 → 打开 app 并展开伙伴面板
+        // 点击通知主体 → 打开该任务详情（不是无条件展开伙伴面板）。
+        // 走 openEntity 语义：MainActivity 收到后只消费一次，冷启动与 onNewIntent 同一路径。
         val contentIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra("reminder_task_id", taskId)
-            putExtra("open_companion", true)
+            putExtra(EXTRA_REMINDER_TASK_ID, taskId)
+            // 标记为「打开实体详情」而非展开聊天面板
+            putExtra(EXTRA_OPEN_ENTITY, true)
         }
         val contentPendingIntent = PendingIntent.getActivity(
             context,
@@ -150,9 +244,29 @@ object NotificationHelper {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
+        // 全屏提醒 Intent：独立宿主 Activity，不复用聊天页。
+        // 只有高优任务且系统授予能力时才设置，否则该字段为 null，通知退化为普通 HIGH。
+        val fullScreenPendingIntent = if (taskPriority == "high" && allowFullScreenIntent) {
+            Intent(context, ReminderFullscreenActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra(EXTRA_REMINDER_TASK_ID, taskId)
+                putExtra(EXTRA_REMINDER_TASK_TITLE, taskTitle)
+                putExtra(EXTRA_REMINDER_MESSAGE, plainMessage)
+                putExtra(EXTRA_REMINDER_TRIGGER_COUNT, triggerCount)
+            }.let {
+                PendingIntent.getActivity(
+                    context,
+                    notificationId + 100,
+                    it,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                )
+            }
+        } else null
+
         // 收拢状态：标题用任务名，正文极短，确保按钮在收拢通知栏中直接可见。
         // 展开后：显示 Nion 的完整提醒文案（BigTextStyle.bigText）。
-        val collapsedText = if (triggerCount == 1) "该做啦～" else "第${triggerCount}次提醒"
+        // 正文口径按 7.13：首次「该做啦 · 现在」，重复「第 N 次提醒」。
+        val collapsedText = if (triggerCount == 1) "该做啦 · 现在" else "第${triggerCount}次提醒"
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher)
             .setContentTitle(taskTitle)
@@ -166,6 +280,15 @@ object NotificationHelper {
             .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setAutoCancel(true)
             .setContentIntent(contentPendingIntent)
+            // 分类与可见性：提醒类通知，锁屏是否展示详情仍遵循用户系统设置
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            // 高优任务的系统提醒通道需求：即使被降级为普通通知也保持 heads-up 行为
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+
+        if (fullScreenPendingIntent != null) {
+            builder.setFullScreenIntent(fullScreenPendingIntent, true)
+        }
 
         // 按钮1：「知道了」—— 标记任务完成（区分每日/普通任务）+ 终止提醒循环 + 取消通知
         if (labels.first.isNotEmpty()) {

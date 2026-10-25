@@ -148,6 +148,13 @@ fun NionApp() {
         }
     }
 
+    /**
+     * 外部请求打开某实体详情（通知主体点击、聊天排期卡跳转等）。
+     * 目标 ID 交给 TaskScreen 消费；消费后清空，保证同一请求只生效一次
+     * （冷启动与 onNewIntent 都走 MainActivity 的同一 pending 字段）。
+     */
+    var pendingOpenEntityId by remember { mutableStateOf<String?>(null) }
+
     // ── 处理来自通知栏的 Intent ──
     val activity = context as? MainActivity
     LaunchedEffect(activity?.pendingIntentAction) {
@@ -173,7 +180,18 @@ fun NionApp() {
                     }
                     activity.clearPendingIntent()
                 }
-                // 点击通知主体 → 展开伙伴面板
+                // 通知主体点击 → 打开该实体详情（不是无条件展开伙伴面板）
+                MainActivity.ACTION_OPEN_ENTITY -> {
+                    val taskId = activity.pendingTaskId
+                    if (taskId != null) {
+                        // 先回任务页，再让 TaskScreen 消费打开请求：
+                        // 用户可能正停在设置/音乐页，直接设展开态是看不到的
+                        navigateToRoute(navController, "tasks")
+                        pendingOpenEntityId = taskId
+                    }
+                    activity.clearPendingIntent()
+                }
+                // 问候/天气等旧通知：展开伙伴面板
                 "open_companion" -> {
                     coroutineScope.launch { dualState.openRight() }
                     activity.clearPendingIntent()
@@ -344,6 +362,8 @@ fun NionApp() {
                                     doNavigateToFocus(taskId, taskTitle, durationMinutes, autoStart = true)
                                     coroutineScope.launch { dualState.closePanel() }
                                 },
+                                openEntityRequest = pendingOpenEntityId,
+                                onOpenEntityConsumed = { pendingOpenEntityId = null },
                             )
                         }
                         composable("schedule") {
@@ -575,18 +595,24 @@ private fun NionLeftPanel(
  * @param onStartFocus 用户点击任务详情中的专注按钮时触发，
  *   回调传入 (taskId, taskTitle, durationMinutes)；
  *   调用方负责设置预选参数并导航到专注页
+ * @param openEntityRequest 外部请求打开的实体 ID（通知点击等），null 表示无请求
+ * @param onOpenEntityConsumed 请求被消费后的回调，用于清空请求避免重复打开
  */
 @Composable
 private fun TasksRoute(
     dualState: DualPanelState,
     viewModel: TaskViewModel,
     onStartFocus: (String, String, Int?) -> Unit,
+    openEntityRequest: String? = null,
+    onOpenEntityConsumed: () -> Unit = {},
 ) {
     TaskScreen(
         dualState = dualState,
         viewModel = viewModel,
         /** 点击任务详情中的专注按钮：立即导航到专注页，面板关闭在后台并行 */
         onStartFocus = onStartFocus,
+        openEntityRequest = openEntityRequest,
+        onOpenEntityConsumed = onOpenEntityConsumed,
     )
 }
 

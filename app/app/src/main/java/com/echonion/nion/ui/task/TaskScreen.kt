@@ -132,10 +132,39 @@ fun TaskScreen(
     viewModel: TaskViewModel,
     /** 用户从任务详情点击"开始专注"时触发，传入 (任务ID, 任务标题, 预选时长分钟) */
     onStartFocus: (taskId: String, taskTitle: String, durationMinutes: Int) -> Unit = { _, _, _ -> },
+    /**
+     * 外部请求打开某实体的详情/编辑器（通知点击、聊天排期卡跳转等）。
+     * 非 null 时本组件会切到该实体所在清单并展开它，随后通过
+     * [onOpenEntityConsumed] 通知调用方清空，保证同一个请求只消费一次。
+     */
+    openEntityRequest: String? = null,
+    onOpenEntityConsumed: () -> Unit = {},
 ) {
     var showAddSheet by remember { mutableStateOf(false) }
     var showAddNote by remember { mutableStateOf(false) }
     var expandedTaskId by remember { mutableStateOf<String?>(null) }
+
+    // ── 消费外部「打开实体」请求（7.8 openEntity 语义的落地点）──
+    // 目标任务可能不在当前清单里（例如用户停在「今天」，通知指向工作清单里的任务），
+    // 直接设 expandedTaskId 只会得到空白浮层。所以先查实体归属，必要时先切清单。
+    LaunchedEffect(openEntityRequest) {
+        val targetId = openEntityRequest ?: return@LaunchedEffect
+        try {
+            val entity = viewModel.findEntityById(targetId)
+            if (entity == null) {
+                // 实体已被删除（可能是旧的提醒残留）：不打开空白浮层
+                return@LaunchedEffect
+            }
+            val ownerChecklist = entity.categoryId
+            if (ownerChecklist != null && ownerChecklist != viewModel.activeChecklistId) {
+                viewModel.setActiveChecklist(ownerChecklist)
+            }
+            expandedTaskId = targetId
+        } finally {
+            // 无论成功与否都消费掉请求，避免用户手动关掉详情后又被弹回来
+            onOpenEntityConsumed()
+        }
+    }
 
     // 笔记搜索关键词：null=不搜索，非空=按关键词过滤笔记列表
     var noteSearchQuery by remember { mutableStateOf<String?>(null) }

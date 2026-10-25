@@ -99,11 +99,9 @@ fun ReminderOverlay(
                 currentEvent = event
                 // 设为可见，触发进入动画
                 cardVisible = true
-                // 只有 app 在前台时才取消通知栏提醒，避免双重打扰。
-                // 防御性检查：即使 Worker 已经做了前台判断，这里再兜底一次
-                if (nionApp.isInForeground) {
-                    NotificationHelper.dismissNotification(app, event.taskId)
-                }
+                // 不在这里取消系统通知：App 内卡片同样是增强层，
+                // 用户可能锁屏/切后台而卡片随之不可见。通知保留作兜底，
+                // 只有用户点了卡片上的明确动作（知道了/稍后/今天算了/开始专注）才取消。
             }
         }
     }

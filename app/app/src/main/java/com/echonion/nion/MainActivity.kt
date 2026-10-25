@@ -126,6 +126,7 @@ class MainActivity : ComponentActivity() {
         val reminderAction = intent.getStringExtra("reminder_action")
         val reminderTaskId = intent.getStringExtra("reminder_task_id")
         val openCompanion = intent.getBooleanExtra("open_companion", false)
+        val openEntity = intent.getBooleanExtra("open_entity", false)
 
         if (reminderAction != null) {
             // 来自通知 Action 按钮（如「开始做了」）
@@ -133,14 +134,19 @@ class MainActivity : ComponentActivity() {
             pendingTaskId = reminderTaskId
             pendingTaskTitle = intent.getStringExtra("focus_task_title")
             Log.d("MainActivity", "解析通知 Intent: action=$reminderAction, taskId=$reminderTaskId")
+        } else if (reminderTaskId != null && openEntity) {
+            // 通知主体点击（7.13 定稿）：打开该任务详情，而不是无条件展开伙伴面板
+            pendingIntentAction = ACTION_OPEN_ENTITY
+            pendingTaskId = reminderTaskId
+            Log.d("MainActivity", "解析通知 Intent: open_entity, taskId=$reminderTaskId")
         } else if (reminderTaskId != null && openCompanion) {
-            // 来自通知主体点击 → 展开伙伴面板
+            // 旧版通知（问候/天气等）：展开伙伴面板
             pendingIntentAction = "open_companion"
             pendingTaskId = reminderTaskId
             Log.d("MainActivity", "解析通知 Intent: open_companion, taskId=$reminderTaskId")
         } else if (reminderTaskId != null) {
-            // 旧版兼容：只带 reminder_task_id，无特殊操作
-            pendingIntentAction = "open_companion"
+            // 兼容旧版本通知：只带 reminder_task_id，按打开实体详情处理更有用
+            pendingIntentAction = ACTION_OPEN_ENTITY
             pendingTaskId = reminderTaskId
             Log.d("MainActivity", "解析通知 Intent (兼容): taskId=$reminderTaskId")
         }
@@ -182,6 +188,16 @@ class MainActivity : ComponentActivity() {
         pendingMusicAuthUsername = username
         pendingMusicAuthPassword = password
         Toast.makeText(this, "注册成功，已自动配置类脑娘音源", Toast.LENGTH_SHORT).show()
+    }
+
+    companion object {
+        /**
+         * 通知主体点击：打开实体详情。
+         *
+         * 与 "open_companion" 区分开：前者是「我要看这条任务」，
+         * 后者是「我要跟伙伴对话」。混用会让用户在锁屏点提醒后被丢进聊天页。
+         */
+        const val ACTION_OPEN_ENTITY = "open_entity"
     }
 
     /**

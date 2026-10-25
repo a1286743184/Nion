@@ -130,8 +130,9 @@ class ReminderFloatingService : Service() {
 
         Log.d(TAG, "显示悬浮窗: taskId=$taskId, title=$taskTitle, trigger=$triggerCount")
 
-        // 取消系统通知（悬浮窗已替代）
-        NotificationHelper.dismissNotification(this, taskId)
+        // 不取消系统通知：浮窗只是增强层，息屏时它根本不可见，
+        // 撤掉通知就等于用户彻底收不到提醒。只有用户点了浮窗上的
+        // 知道了/稍后/今天算了/开始专注，才按动作语义取消（见各 handleXxx）。
 
         // 显示悬浮窗
         showFloatingWindow()

@@ -1126,6 +1126,24 @@ class TaskViewModel(
     }
 
     /**
+     * 按 ID 查实体（任务或笔记），用于「从通知/聊天跳转到某实体」的定位。
+     *
+     * 为什么不只在内存列表里找：目标实体可能不在当前清单视图内
+     * （例如用户停在「今天」，通知指向工作清单里的任务）。直接查库能拿到真实归属
+     * （categoryId），调用方据此先切清单再展开，避免打开空白浮层。
+     *
+     * @param id 实体 ID
+     * @return 实体数据；不存在（已被删除）时返回 null
+     */
+    suspend fun findEntityById(id: String): TaskData? {
+        return try {
+            withContext(Dispatchers.IO) { core.getTask(id) }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
      * 全局搜索所有笔记型清单中的笔记。
      * @param query 搜索关键词
      * @return 匹配的笔记列表

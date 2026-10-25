@@ -66,28 +66,33 @@ class ReminderWorker(
             )
 
             // 4. 发送带 Action 按钮的通知
+            //    通知是「必达兜底」：后面无论走浮窗还是 App 内卡片，都不撤它。
+            //    只有用户明确处理（知道了 / 稍后提醒 / 今天算了 / 开始专注）才按动作语义取消。
+            val canUseFullscreen = NotificationHelper.canUseFullScreenIntent(applicationContext)
             NotificationHelper.showReminderNotification(
-                applicationContext, taskId, taskTitle, message, triggerCount,
+                applicationContext, taskId, taskTitle, message, triggerCount, taskPriority,
+                allowFullScreenIntent = canUseFullscreen,
             )
 
-            // 5. 通过 OverlayDispatcher 分发：有权限→悬浮窗 / 无权限+前台→Overlay / 兜底通知
-            // 通知栏通知已在第 4 步发送，悬浮窗/Overlay 接管后会主动取消
+            // 5. 通过 OverlayDispatcher 分发增强展示形态：
+            //    有权限 → 悬浮窗 / 无权限 + 前台 → App 内卡片 / 其余 → 只留系统通知
+            //    注意：三个分支都**不**调用 dismissNotification —— 息屏时浮窗不可见，
+            //    撤掉通知就等于用户永远收不到提醒（F7 根因）。
             OverlayDispatcher.dispatch(
                 context = applicationContext,
                 onForeground = {
-                    // 无权限 + 前台：发 SharedFlow 事件 → Compose ReminderOverlay 显示 App 内悬浮卡片
+                    // 无权限 + 前台：发 SharedFlow 事件 → Compose ReminderOverlay 显示 App 内卡片
                     app.postReminderEvent(ReminderEvent(taskId, taskTitle, type, message, triggerCount, taskPriority))
-                    // 前台 Overlay 已接管，取消系统通知避免双重提醒
-                    NotificationHelper.dismissNotification(applicationContext, taskId)
-                    Log.d(TAG, "已发送提醒事件到 UI（前台模式）")
+                    Log.d(TAG, "已发送提醒事件到 UI（前台卡片，系统通知保留作兜底）")
                 },
                 onBackgroundOverlay = {
                     // 有悬浮窗权限（不论前后台）→ 启动 ReminderFloatingService
-                    ReminderFloatingService.start(
-                        applicationContext, taskId, taskTitle, message, triggerCount, taskPriority,
-                    )
-                    // 悬浮窗已接管，取消系统通知避免双重提醒
-                    NotificationHelper.dismissNotification(applicationContext, taskId)
+                    // 浮窗只是增强层：显示失败也不影响系统通知
+                    runCatching {
+                        ReminderFloatingService.start(
+                            applicationContext, taskId, taskTitle, message, triggerCount, taskPriority,
+                        )
+                    }.onFailure { Log.w(TAG, "启动悬浮窗失败，系统通知仍在", it) }
                     Log.d(TAG, "已启动悬浮窗 Service（模式=${if (app.isInForeground) "前台" else "后台"}）")
                 },
                 onFallback = {

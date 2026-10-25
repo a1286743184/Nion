@@ -45,6 +45,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -56,6 +57,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -87,6 +89,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.echonion.nion.core
+import com.echonion.nion.reminder.NotificationHelper
 import uniffi.nion_core.NionCore
 import com.echonion.nion.ui.companion.weather.LocationHelper
 import com.echonion.nion.ui.companion.phoneagent.PhoneAgentBridge
@@ -381,8 +384,14 @@ fun SettingsScreen(
             // 悬浮窗提醒权限开关
             OverlayPermissionCard(context = context)
 
-            // 后台提醒（电池优化白名单）权限开关
+            // 系统通知权限（提醒的必达兜底；被关掉时悬浮窗不能作为可靠替代）
+            NotificationPermissionCard(context = context)
+
+            // 后台提醒（电池优化白名单）+ 厂商后台运行引导
             BatteryPermissionCard(context = context)
+
+            // 高优全屏提醒能力（Android 14+ 需单独授权，未授权只影响全屏唤亮）
+            FullScreenIntentCard(context = context)
 
             Spacer(modifier = Modifier.height(8.dp))
 
@@ -546,45 +555,189 @@ private fun OverlayPermissionCard(context: Context) {
 }
 
 /**
- * 电池优化白名单权限卡片 —— 自动检测是否在白名单中，返回页面时刷新。
+ * 电池优化白名单卡片 + 厂商后台运行引导（7.14）。
+ *
+ * 状态口径分两层，不互相冒充：
+ * - 标准 Android 电池优化：可实测（isIgnoringBatteryOptimizations），写确定结果；
+ * - 厂商后台管控：多数 ROM 无公开查询接口，只能写「请在系统设置中确认」，
+ *   并用本地勾选记录「我已检查」，绝不伪造「已修复」。
  *
  * @param context 用于检查电池优化状态和跳转系统设置
  */
 @Composable
 private fun BatteryPermissionCard(context: Context) {
+    var batteryOptimized by remember { mutableStateOf(isBatteryOptimizationOn(context)) }
+    // 厂商引导抽屉是否展开（默认收起，只在需要时点开）
+    var showVendorSheet by remember { mutableStateOf(false) }
+    // 用户是否已自行确认过厂商设置（只记录本地勾选，与系统实测状态分开展示）
+    var vendorChecked by remember { mutableStateOf(false) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            // 每次从系统设置页返回都重查标准权限，避免用户改了设置回来还显示旧状态
+            if (event == Lifecycle.Event.ON_RESUME) {
+                batteryOptimized = isBatteryOptimizationOn(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val vendorName = remember { com.echonion.nion.reminder.VendorBatteryHelper.vendorDisplayName() }
+
+    Column {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = MaterialTheme.shapes.medium,
+            color = MaterialTheme.colorScheme.surfaceContainerLowest,
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    LucideIcons.BatteryWarning,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.size(24.dp),
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "后台提醒",
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        if (batteryOptimized) "已设置，定时提醒闹钟可正常触发"
+                        else "未设置，定时提醒可能被系统省电策略拦截",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (batteryOptimized) MaterialTheme.colorScheme.onSurfaceVariant
+                        else MaterialTheme.colorScheme.error,
+                    )
+                }
+                if (batteryOptimized) {
+                    Icon(
+                        LucideIcons.Check,
+                        contentDescription = "已设置",
+                        tint = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.size(20.dp),
+                    )
+                } else {
+                    TextButton(onClick = {
+                        com.echonion.nion.reminder.VendorBatteryHelper.openBatterySettings(context)
+                    }) {
+                        Text("去设置")
+                    }
+                }
+            }
+        }
+
+        // ── 厂商后台运行区块 ──
+        // 出现条件（7.14）：设备有已知厂商层，且标准电池优化未设置，或用户已打开过检查。
+        if (vendorName != null && (!batteryOptimized || showVendorSheet || vendorChecked)) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(MaterialTheme.shapes.medium)
+                    .clickable { showVendorSheet = true },
+                shape = MaterialTheme.shapes.medium,
+                color = MaterialTheme.colorScheme.surfaceContainerLowest,
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        LucideIcons.TriangleAlert,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.size(24.dp),
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "厂商后台运行",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            // 措辞刻意保留不确定性：厂商开关无法程序化读取
+                            if (vendorChecked) "你已检查过 $vendorName 的后台设置"
+                            else "$vendorName 可能额外限制后台，建议检查",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Icon(
+                        LucideIcons.ChevronRight,
+                        contentDescription = "展开厂商后台运行说明",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+        }
+
+        // ── 厂商引导底部抽屉 ──
+        if (showVendorSheet) {
+            VendorBackgroundSheet(
+                vendorName = vendorName ?: "此设备",
+                onOpenSystemSettings = {
+                    com.echonion.nion.reminder.VendorBatteryHelper.openBatterySettings(context)
+                },
+                onChecked = {
+                    vendorChecked = true
+                    showVendorSheet = false
+                },
+                onDismiss = { showVendorSheet = false },
+            )
+        }
+    }
+}
+
+/**
+ * 读取当前是否已关闭标准电池优化（true = 已忽略优化 = 已设置好）。
+ */
+private fun isBatteryOptimizationOn(context: Context): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+    return (context.getSystemService(Context.POWER_SERVICE) as PowerManager)
+        .isIgnoringBatteryOptimizations(context.packageName)
+}
+
+/**
+ * 系统通知权限卡片 —— 提醒的必达兜底。
+ *
+ * 这是三种能力里唯一「必须」的一项：通知被关掉时，悬浮窗在息屏状态下看不见，
+ * 提醒就等于彻底收不到。因此这里把状态写成阻断性提示，而不是像悬浮窗那样轻描淡写。
+ *
+ * @param context 用于检查通知开关并跳系统设置
+ */
+@Composable
+private fun NotificationPermissionCard(context: Context) {
+    var enabled by remember { mutableStateOf(NotificationHelper.areNotificationsEnabled(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                enabled = NotificationHelper.areNotificationsEnabled(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.medium,
         color = MaterialTheme.colorScheme.surfaceContainerLowest,
     ) {
-        var batteryOptimized by remember {
-            mutableStateOf(
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    !(context.getSystemService(Context.POWER_SERVICE) as PowerManager)
-                        .isIgnoringBatteryOptimizations(context.packageName)
-                } else {
-                    false
-                }
-            )
-        }
-        val lifecycleOwner = LocalLifecycleOwner.current
-        DisposableEffect(lifecycleOwner) {
-            val observer = LifecycleEventObserver { _, event ->
-                if (event == Lifecycle.Event.ON_RESUME) {
-                    batteryOptimized = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        !(context.getSystemService(Context.POWER_SERVICE) as PowerManager)
-                            .isIgnoringBatteryOptimizations(context.packageName)
-                    } else {
-                        false
-                    }
-                }
-            }
-            lifecycleOwner.lifecycle.addObserver(observer)
-            onDispose {
-                lifecycleOwner.lifecycle.removeObserver(observer)
-            }
-        }
-
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -592,7 +745,7 @@ private fun BatteryPermissionCard(context: Context) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                LucideIcons.BatteryWarning,
+                LucideIcons.Bell,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.secondary,
                 modifier = Modifier.size(24.dp),
@@ -600,35 +753,194 @@ private fun BatteryPermissionCard(context: Context) {
             Spacer(modifier = Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    "后台提醒",
+                    "系统通知",
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    if (!batteryOptimized) "已设置，定时提醒闹钟可正常触发"
-                    else "未设置，定时提醒可能被系统省电策略拦截",
+                    if (enabled) "已开启，提醒会出现在通知栏"
+                    else "系统通知已关闭，悬浮窗不能作为可靠替代",
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (!batteryOptimized) MaterialTheme.colorScheme.onSurfaceVariant
+                    color = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
                     else MaterialTheme.colorScheme.error,
                 )
             }
-            if (batteryOptimized) {
-                TextButton(onClick = {
-                    com.echonion.nion.reminder.VendorBatteryHelper.openBatterySettings(context)
-                }) {
-                    Text("去设置")
-                }
-            } else {
+            if (enabled) {
                 Icon(
                     LucideIcons.Check,
-                    contentDescription = "已设置",
+                    contentDescription = "已开启",
                     tint = MaterialTheme.colorScheme.secondary,
                     modifier = Modifier.size(20.dp),
                 )
+            } else {
+                TextButton(onClick = { NotificationHelper.openNotificationSettings(context) }) {
+                    Text("去开启")
+                }
             }
         }
     }
 }
+
+/**
+ * 高优全屏提醒能力卡片（Android 14+）。
+ *
+ * 这是「增强」而非「阻断」：未授权时提醒仍以 HIGH 通知 + heads-up 到达，
+ * 只是息屏时不会自动唤亮全屏页。因此状态用中性色，不用 error。
+ *
+ * @param context 用于检查能力并跳系统设置
+ */
+@Composable
+private fun FullScreenIntentCard(context: Context) {
+    // 低版本系统默认允许，直接不展示这张卡（避免无意义的常驻项）
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return
+
+    var allowed by remember { mutableStateOf(NotificationHelper.canUseFullScreenIntent(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                allowed = NotificationHelper.canUseFullScreenIntent(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerLowest,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                LucideIcons.AlarmClock,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.secondary,
+                modifier = Modifier.size(24.dp),
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "全屏提醒",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    if (allowed) "已允许，高优任务在息屏时可直接唤亮提醒页"
+                    else "未允许，高优提醒会退回普通通知（仍会按时到达）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (allowed) {
+                Icon(
+                    LucideIcons.Check,
+                    contentDescription = "已允许",
+                    tint = MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.size(20.dp),
+                )
+            } else {
+                TextButton(onClick = { NotificationHelper.openFullScreenIntentSettings(context) }) {
+                    Text("去允许")
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 厂商后台运行引导抽屉（7.14）。
+ *
+ * 三步说明固定：允许后台运行、允许自启动、省电策略设为不限制。
+ * 只展示当前厂商的名称与说明（不列出无关品牌清单），并明确区分
+ * 「打开系统设置」与「我已检查」两个动作。
+ *
+ * @param vendorName          当前厂商名，用于文案
+ * @param onOpenSystemSettings 点击「打开系统设置」
+ * @param onChecked           点击「我已检查」，记录本地勾选
+ * @param onDismiss           关闭抽屉
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun VendorBackgroundSheet(
+    vendorName: String,
+    onOpenSystemSettings: () -> Unit,
+    onChecked: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text(
+                "让提醒准时到达",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                "$vendorName 在标准电池优化之外还有自己的后台管控。请在系统设置里确认以下三项；" +
+                    "Nion 无法读取这些开关的真实状态。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            listOf(
+                "允许后台运行" to "让 Nion 在后台保持存活，提醒才有机会发出",
+                "允许自启动" to "重启手机后提醒闹钟能自动恢复",
+                "将省电策略设为不限制" to "避免系统在息屏时冻结进程、丢弃闹钟",
+            ).forEachIndexed { index, (title, desc) ->
+                Row(verticalAlignment = Alignment.Top) {
+                    // 步骤序号用圆形背景，保证不用颜色也能区分顺序
+                    Surface(
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        modifier = Modifier.size(24.dp),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(
+                                "${index + 1}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column {
+                        Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                        Text(
+                            desc,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Button(
+                onClick = onOpenSystemSettings,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Text("打开系统设置")
+            }
+            TextButton(onClick = onChecked, modifier = Modifier.fillMaxWidth()) {
+                Text("我已检查")
+            }
+        }
+    }
+}
+
 
 /**
  * 数据管理卡片 —— 提供导出和导入功能。
