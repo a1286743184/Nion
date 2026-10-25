@@ -120,6 +120,12 @@ fun NionApp() {
         mutableStateOf(loadPresetName(core))
     }
     val dualState = remember { DualPanelState() }
+
+    /**
+     * 外部请求侧边栏切到指定面板（当前仅用于设置页 →"模型配置"）。
+     * 侧边栏消费后通过回调清空为 null，避免重复触发。
+     */
+    var pendingPanelRequest by remember { mutableStateOf<String?>(null) }
     val viewModel = taskViewModel()
     val coroutineScope = rememberCoroutineScope()
     val navController = rememberNavController()
@@ -314,6 +320,9 @@ fun NionApp() {
                                 isVisible = dualState.isRightOpen,
                                 currentRoute = currentRoute,
                                 modifier = modifier,
+                                // 设置页点"模型配置"时置为 "config"，侧边栏消费后清空
+                                requestedPanel = pendingPanelRequest,
+                                onPanelRequestConsumed = { pendingPanelRequest = null },
                             )
                         }
                     },
@@ -374,6 +383,11 @@ fun NionApp() {
                                     currentPresetName = presetName
                                 },
                                 onOpenCompanion = { dualState.openRight() },
+                                // 设置页"模型配置"入口：打开侧边栏并请求切到配置面板
+                                onOpenModelConfig = {
+                                    coroutineScope.launch { dualState.openRight() }
+                                    pendingPanelRequest = "config"
+                                },
                             )
                         }
                     }
@@ -656,6 +670,8 @@ private fun SettingsRoute(
     themePalette: ThemePalette,
     onThemePaletteChange: (ThemePalette, String?) -> Unit,
     onOpenCompanion: () -> Unit,
+    /** 打开伙伴侧边栏并直达模型配置面板 */
+    onOpenModelConfig: () -> Unit = onOpenCompanion,
 ) {
     // 将 customThemes 提升为 remember state，
     // 使得重命名/删除等操作可以直接更新 state 触发 UI 刷新
@@ -676,6 +692,7 @@ private fun SettingsRoute(
         currentPresetName = currentPresetName,
         themePalette = themePalette,
         customThemes = customThemes,
+        onOpenModelConfig = onOpenModelConfig,
         onThemeChange = { theme ->
             onThemePaletteChange(theme.palette(), theme.name)
             try {

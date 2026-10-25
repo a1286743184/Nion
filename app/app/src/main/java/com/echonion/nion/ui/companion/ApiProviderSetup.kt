@@ -37,6 +37,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -74,7 +75,8 @@ import com.echonion.nion.ui.icons.LucideIcons
 fun ApiProviderSetup(
     companionName: String = "Nion",
     initialConfig: SavedConfig? = null,
-    onSave: (provider: ProviderConfig, apiKey: String, model: String, baseUrl: String) -> Unit,
+    viewModel: CompanionViewModel? = null,
+    onSave: (provider: ProviderConfig, apiKey: String, model: String, baseUrl: String, effort: String?) -> Unit,
 ) {
     val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
@@ -100,8 +102,12 @@ fun ApiProviderSetup(
 
     // 模型获取相关状态
     var isFetchingModels by remember { mutableStateOf(false) }
-    // 从 API 获取到的可用模型名列表
-    var availableModels by remember { mutableStateOf<List<String>>(emptyList()) }
+    // 从 API 获取到的模型目录（含 effort 档位、多模态等上游元数据）。
+    // 初值取 ViewModel 里最近一次拉取的共享目录：用户之前拉过的话，一进页面
+    // 就能立刻看到模型列表与思考强度档位，不必再点一次刷新。
+    var availableModels by remember {
+        mutableStateOf(viewModel?.modelCatalog.orEmpty())
+    }
     // 模型获取失败时的错误信息
     var fetchError by remember { mutableStateOf<String?>(null) }
     // 模型下拉菜单展开状态（从获取到的列表中选取）
@@ -110,6 +116,12 @@ fun ApiProviderSetup(
     var selectedModelName by remember { mutableStateOf(initialConfig?.model ?: "") }
     // 自定义 provider 时手动输入模型名，编辑模式下预填充
     var customModelInput by remember { mutableStateOf(initialConfig?.model ?: "") }
+    // 用户选中的思考强度档位；null/"默认" = 不发送 effort 参数（跟随上游默认）。
+    // 编辑模式下预填充原配置的档位。
+    var selectedEffort by remember { mutableStateOf(initialConfig?.reasoningEffort) }
+
+    // 当前选中模型的元数据（决定 effort 档位选项列表和能力标签展示）
+    val selectedModelMeta = availableModels.find { it.id == selectedModelName }
 
     val selectedProvider = builtInProviders[selectedProviderIndex]
     val isCustom = selectedProvider.name == "自定义"
@@ -118,18 +130,33 @@ fun ApiProviderSetup(
     val hasModels = availableModels.isNotEmpty()
 
     /**
-     * 调用 ChatService.fetchModels 获取当前 provider 的可用模型列表。
+     * 调用 ChatService.fetchModelCatalog 获取模型目录（含能力元数据）。
+     *
+     * 自定义 Provider 同样允许拉取：中转站/聚合网关基本都兼容 GET /models，
+     * 拉取失败不阻塞——错误显示后用户仍可手动输入模型名。
+     * 结果同时写入 ViewModel 的共享目录（供发图前校验等全局使用）。
      */
     fun fetchModels() {
-        if (isCustom) return // 自定义 provider 不获取模型
+        if (isCustom) {
+            // 自定义 provider：baseUrl 必须已填写才能拉取
+            if (customBaseUrl.trim().isEmpty() || isFetchingModels) return
+        }
         val key = apiKeyInput.trim()
         if (key.isEmpty() || isFetchingModels) return
+        val effectiveProvider = if (isCustom) {
+            val base = customBaseUrl.trim().let {
+                if (it.isNotEmpty() && !it.startsWith("http://") && !it.startsWith("https://")) "https://$it" else it
+            }
+            selectedProvider.copy(baseUrl = base)
+        } else selectedProvider
         isFetchingModels = true
         fetchError = null
         scope.launch {
-            val result = ChatService.fetchModels(selectedProvider, key)
+            val result = ChatService.fetchModelCatalog(effectiveProvider, key)
             result.onSuccess { models ->
                 availableModels = models
+                // 同步到 ViewModel 共享目录（发图前校验用）；viewModel 为 null 时静默跳过
+                viewModel?.updateModelCatalog(models)
             }.onFailure { e ->
                 fetchError = e.message ?: "获取模型失败"
             }
@@ -144,6 +171,17 @@ fun ApiProviderSetup(
             .padding(horizontal = 8.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
+        // 进入页面时自动拉取一次模型目录，让用户一打开就能看到模型能力标签与
+        // 思考强度档位，不必先猜到要手动点按钮。
+        // 触发条件：已有 API key（编辑模式/刚输完）、目录为空、自定义时 baseUrl 已填。
+        // 仅首次组合执行；失败不在此弹错（避免网络差时进页面一片红），
+        // 错误由用户手动点拉取时展示。
+        LaunchedEffect(Unit) {
+            if (apiKeyInput.isNotBlank() && availableModels.isEmpty() &&
+                (!isCustom || customBaseUrl.isNotBlank())) {
+                fetchModels()
+            }
+        }
         // 标题区：编辑模式显示"编辑配置"，新增模式显示欢迎语
         Text(
             if (isEditMode) "编辑配置" else "欢迎使用 $companionName",
@@ -175,16 +213,25 @@ fun ApiProviderSetup(
                 dropdownExpanded = false
                 availableModels = emptyList()
                 selectedModelName = ""
+                selectedEffort = null
                 fetchError = null
             },
             onDropdownToggle = { dropdownExpanded = !dropdownExpanded },
         )
 
-        // ---- 自定义 provider 时：显示 baseUrl 输入框 ----
+        // 自定义 provider：baseUrl 变化时清空旧的拉取结果（旧列表基于旧地址）
         if (isCustom) {
             OutlinedTextField(
                 value = customBaseUrl,
-                onValueChange = { customBaseUrl = it },
+                onValueChange = {
+                    customBaseUrl = it
+                    if (availableModels.isNotEmpty()) {
+                        availableModels = emptyList()
+                        selectedModelName = ""
+                        selectedEffort = null
+                        fetchError = null
+                    }
+                },
                 label = { Text("API Base URL") },
                 placeholder = { Text("https://api.example.com/v1") },
                 modifier = Modifier.fillMaxWidth(),
@@ -211,6 +258,7 @@ fun ApiProviderSetup(
                 if (availableModels.isNotEmpty()) {
                     availableModels = emptyList()
                     selectedModelName = ""
+                    selectedEffort = null
                     fetchError = null
                 }
             },
@@ -224,6 +272,7 @@ fun ApiProviderSetup(
             isCustom = isCustom,
             isFetchingModels = isFetchingModels,
             apiKeyInput = apiKeyInput,
+            baseUrlInput = customBaseUrl,
             onFetchModels = { fetchModels() },
         )
 
@@ -237,30 +286,72 @@ fun ApiProviderSetup(
             )
         }
 
-        if (!isCustom) {
-            // 模型选择器 —— 从 API 获取的列表中选取
-            if (hasModels) {
-                ModelSelectorCard(
-                    models = availableModels,
-                    selectedModelName = selectedModelName,
-                    onModelSelected = { model ->
-                        selectedModelName = model
-                        modelDropdownExpanded = false
-                    },
-                    dropdownExpanded = modelDropdownExpanded,
-                    onDropdownToggle = { modelDropdownExpanded = !modelDropdownExpanded },
-                )
-            }
+        // 模型选择器 —— 两种 Provider 共用同一套卡片（拉取到的目录含能力元数据）。
+        // 无数据时给出明确提示，避免用户面对一片空白不知道下一步做什么。
+        if (hasModels) {
+            ModelSelectorCard(
+                models = availableModels,
+                selectedModelName = selectedModelName,
+                onModelSelected = { model ->
+                    selectedModelName = model
+                    modelDropdownExpanded = false
+                    // 切换模型时按上游目录重置思考强度：
+                    // 预选上游默认档位；上游未声明档位时置 null（不发送参数）
+                    val meta = availableModels.find { it.id == model }
+                    selectedEffort = if (meta?.hasEfforts == true) {
+                        meta.defaultEffort?.takeIf { it in meta.supportedEfforts }
+                            ?: meta.supportedEfforts.firstOrNull()
+                    } else null
+                },
+                dropdownExpanded = modelDropdownExpanded,
+                onDropdownToggle = { modelDropdownExpanded = !modelDropdownExpanded },
+            )
         } else {
-            // 自定义 provider：手动输入模型名
+            // 尚未拉取：提示用户点右上角按钮。拉取后这里会变成可展开的模型列表，
+            // 每个条目下方显示该模型的能力标签（可看图 / 思考档位 / 上下文长度）。
+            Text(
+                if (fetchError != null) {
+                    "拉取失败，可在下方手动填写模型名"
+                } else {
+                    "点右上角「拉取模型列表」，即可看到每个模型支持的能力与思考强度档位"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                modifier = Modifier.padding(start = 4.dp),
+            )
+        }
+
+        // 自定义 provider 额外保留手动输入框兜底：中转站不一定兼容 GET /models
+        if (isCustom) {
             CustomModelInputField(
                 modelName = customModelInput,
-                // 同步更新 selectedModelName，确保保存时能拿到最新值
+                // 手动输入模型名：同步 selectedModelName 确保保存时拿到最新值；
+                // 手输模型不在目录中，元数据自然查不到 → effort 保持用户所选/null
                 onModelNameChange = {
                     customModelInput = it
                     selectedModelName = it
                 },
                 focusManager = focusManager,
+            )
+        }
+
+        // ---- 思考强度档位选择（透传上游目录声明的档位）----
+        // 有档位元数据时渲染选择行；已拉取到目录但该模型未声明档位时说明原因，
+        // 未拉取时给出引导——避免用户完全不知道这里还能配思考强度。
+        val effortChoices = selectedModelMeta?.supportedEfforts.orEmpty()
+        if (effortChoices.isNotEmpty()) {
+            EffortSelectorRow(
+                efforts = effortChoices,
+                defaultEffort = selectedModelMeta?.defaultEffort,
+                selectedEffort = selectedEffort,
+                onEffortSelected = { effort -> selectedEffort = effort },
+            )
+        } else if (hasModels && selectedModelName.isNotBlank()) {
+            Text(
+                "该模型未声明思考强度档位，将按上游默认值运行（不发送 effort 参数）",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                modifier = Modifier.padding(start = 4.dp),
             )
         }
 
@@ -283,6 +374,9 @@ fun ApiProviderSetup(
                     apiKeyInput.trim(),
                     if (isCustom) customModelInput.trim() else selectedModelName,
                     if (isCustom) customBaseUrl.trim().let { if (it.isNotEmpty() && !it.startsWith("http://") && !it.startsWith("https://")) "https://$it" else it } else "",
+                    // selectedEffort = null 表示"跟随上游默认"，请求时不发送 effort 参数；
+                    // 选了具体档位则原样透传给上游
+                    selectedEffort,
                 )
             },
         )
@@ -470,20 +564,29 @@ private fun ApiKeyInputField(
 }
 
 /**
- * 模型选择区域的标题行 —— 左侧显示"3. 选择模型"，右侧显示获取/重试按钮。
+ * 模型选择区域的标题行 —— 左侧"3. 选择模型"，右侧显眼的"拉取模型列表"按钮。
  *
- * @param isCustom 是否为自定义 provider（自定义时不显示获取按钮）
+ * 历史缺陷：此处曾是一个 18dp 的小刷新图标，且对自定义 Provider 直接隐藏，
+ * 用户进入配置页后看不到任何可点的入口，误以为功能没有实现。
+ * 现改为带文字的按钮，并对所有 Provider 开放。
+ *
+ * @param isCustom 是否为自定义 provider（自定义时额外要求 baseUrl 已填写才能拉取）
  * @param isFetchingModels 是否正在从 API 获取模型列表
- * @param apiKeyInput 当前 API key 值，用于控制获取按钮的启用/禁用状态
- * @param onFetchModels 用户点击获取/重试按钮时触发
+ * @param apiKeyInput 当前 API key 值，用于控制按钮的启用/禁用状态
+ * @param baseUrlInput 自定义 provider 的 baseUrl，用于判断能否拉取
+ * @param onFetchModels 用户点击拉取按钮时触发
  */
 @Composable
 private fun ModelSectionHeader(
     isCustom: Boolean,
     isFetchingModels: Boolean,
     apiKeyInput: String,
+    baseUrlInput: String,
     onFetchModels: () -> Unit,
 ) {
+    // 按钮可用性：API key 必填；自定义 Provider 还需 baseUrl
+    val canFetch = apiKeyInput.isNotBlank() && (!isCustom || baseUrlInput.isNotBlank())
+
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -494,48 +597,158 @@ private fun ModelSectionHeader(
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        if (!isCustom) {
-            // 获取/重试图标：加载中转圈，否则显示刷新图标
-            if (isFetchingModels) {
+        // 带文字的拉取按钮：比小图标更容易被发现，所有 Provider 均可见
+        if (isFetchingModels) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(
-                    modifier = Modifier.size(18.dp),
+                    modifier = Modifier.size(16.dp),
                     strokeWidth = 2.dp,
                 )
-            } else {
-                IconButton(
-                    onClick = onFetchModels,
-                    enabled = apiKeyInput.isNotBlank(),
-                    modifier = Modifier.size(32.dp),
-                ) {
-                    Icon(
-                        LucideIcons.RefreshCw,
-                        contentDescription = "获取模型列表",
-                        modifier = Modifier.size(18.dp),
-                        tint = if (apiKeyInput.isNotBlank())
-                            MaterialTheme.colorScheme.primary
-                        else
-                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
-                    )
-                }
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    "拉取中...",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) { if (canFetch) onFetchModels() }
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    LucideIcons.RefreshCw,
+                    contentDescription = "拉取模型列表",
+                    modifier = Modifier.size(16.dp),
+                    tint = if (canFetch) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    "拉取模型列表",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Medium,
+                    color = if (canFetch) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                )
             }
         }
     }
 }
 
 /**
- * 模型展开式选择器 —— 与 ProviderSelectorCard 同款的圆角卡片样式。
- * 从 API 获取到的模型列表中选取一个模型。
+ * 思考强度档位选择行 —— 档位列表完全来自上游模型目录（supported_efforts），透传不造默认。
  *
- * @param models 从 API 获取到的可用模型名列表
+ * 交互：横排圆角小胶囊，点击即选。首项固定为"默认"（选中时 null，
+ * 发请求不带 effort 参数，跟随上游默认值）；其后是上游声明的各档位，
+ * 上游标注的 default_effort 会在档位名后缀"（上游默认）"提示。
+ *
+ * @param efforts       上游声明的档位列表（如 ["low","high","max"]），非空才渲染此行
+ * @param defaultEffort 上游标注的默认档位，用于提示文案；null 表示上游未标注
+ * @param selectedEffort 当前选中的档位；null 表示"跟随上游默认"
+ * @param onEffortSelected 用户点击某档位时触发；点击"默认"时传 null
+ */
+@Composable
+private fun EffortSelectorRow(
+    efforts: List<String>,
+    defaultEffort: String?,
+    selectedEffort: String?,
+    onEffortSelected: (String?) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            "思考强度",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            // 首项"默认"：null = 不发送参数
+            EffortChip(
+                label = "默认" + (defaultEffort?.let { "($it)" } ?: ""),
+                selected = selectedEffort == null,
+                onClick = { onEffortSelected(null) },
+                modifier = Modifier.weight(1f),
+            )
+            // 上游声明的各档位，原样透传
+            efforts.forEach { effort ->
+                EffortChip(
+                    label = effort,
+                    selected = selectedEffort == effort,
+                    onClick = { onEffortSelected(effort) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 单个思考强度档位胶囊 —— 选中时主题色填充，未选中时描边样式。
+ *
+ * @param label    档位显示文本（如 "low"、"默认(high)"）
+ * @param selected 是否选中
+ * @param onClick  点击回调
+ * @param modifier 布局修饰符
+ */
+@Composable
+private fun EffortChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = if (selected) MaterialTheme.colorScheme.primary
+        else MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = modifier.clip(RoundedCornerShape(10.dp)),
+    ) {
+        Box(
+            modifier = Modifier
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) { onClick() }
+                .padding(vertical = 8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (selected) MaterialTheme.colorScheme.onPrimary
+                else MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+/**
+ * 模型展开式选择器 —— 与 ProviderSelectorCard 同款的圆角卡片样式。
+ * 从 API 获取到的模型目录中选取一个模型；每个条目展示上游下发的能力标签
+ * （思考强度档位、多模态、上下文长度），无元数据（官方 API）时只显示模型名。
+ *
+ * @param models 从 API 获取到的模型元数据列表
  * @param selectedModelName 当前选中的模型名，为空表示尚未选择
- * @param onModelSelected 用户点击某个模型时触发，传入被选中的模型名；
- *                         调用方需负责更新 selectedModelName 及收起下拉菜单
+ * @param onModelSelected 用户点击某个模型时触发，传入被选中的模型 ID；
+ *                        调用方需负责更新 selectedModelName 及收起下拉菜单
  * @param dropdownExpanded 下拉菜单是否展开
  * @param onDropdownToggle 用户点击头部区域时触发，用于切换展开/收起状态
  */
 @Composable
 private fun ModelSelectorCard(
-    models: List<String>,
+    models: List<ModelMetadata>,
     selectedModelName: String,
     onModelSelected: (model: String) -> Unit,
     dropdownExpanded: Boolean,
@@ -588,27 +801,40 @@ private fun ModelSelectorCard(
             ) {
                 Column(modifier = Modifier.fillMaxWidth()) {
                     models.forEach { model ->
-                        val isModelSelected = model == selectedModelName
+                        val isModelSelected = model.id == selectedModelName
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable(
                                     interactionSource = remember { MutableInteractionSource() },
                                     indication = null,
-                                ) { onModelSelected(model) }
+                                ) { onModelSelected(model.id) }
                                 .padding(horizontal = 16.dp, vertical = 12.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text(
-                                model,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = if (isModelSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                color = if (isModelSelected)
-                                    MaterialTheme.colorScheme.primary
-                                else
-                                    MaterialTheme.colorScheme.onSurface,
-                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    model.id,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (isModelSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = if (isModelSelected)
+                                        MaterialTheme.colorScheme.primary
+                                    else
+                                        MaterialTheme.colorScheme.onSurface,
+                                )
+                                // 能力标签行 —— 仅当上游声明了元数据时显示
+                                val tags = modelTagLabels(model)
+                                if (tags.isNotEmpty()) {
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        tags.joinToString(" · "),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 2,
+                                    )
+                                }
+                            }
                             if (isModelSelected) {
                                 Icon(
                                     LucideIcons.Check,
@@ -623,6 +849,31 @@ private fun ModelSelectorCard(
             }
         }
     }
+}
+
+/**
+ * 生成单个模型的能力标签文本列表（用于模型选择下拉条目）。
+ *
+ * 标签顺序：多模态 → 思考档位 → 上下文长度。全部来自上游目录下发值，
+ * 未声明的不显示（官方 OpenAI/DeepSeek API 无元数据 → 空列表 → 不渲染标签行）。
+ *
+ * @param model 模型元数据
+ * @return 标签文本列表，如 ["可看图", "思考: low/high/max", "1M 上下文"]
+ */
+private fun modelTagLabels(model: ModelMetadata): List<String> {
+    val tags = mutableListOf<String>()
+    when (model.supportsImage) {
+        true -> tags.add("可看图")
+        false -> tags.add("无视觉")
+        null -> {} // 上游未声明，不标注
+    }
+    if (model.hasEfforts) {
+        tags.add("思考: " + model.supportedEfforts.joinToString("/"))
+    }
+    model.contextLength?.let { len ->
+        tags.add(if (len >= 1_000_000) "${len / 1_000_000}M 上下文" else "${len / 1000}K 上下文")
+    }
+    return tags
 }
 
 /**

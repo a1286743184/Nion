@@ -186,6 +186,13 @@ fun CompanionSidebar(
     currentRoute: String? = null,
     viewModel: CompanionViewModel = viewModel(factory = CompanionViewModel.Factory),
     modifier: Modifier = Modifier,
+    /**
+     * 外部请求打开某个面板（如设置页点"模型配置"→"switch"）。
+     * 非 null 时侧边栏切到该面板，消费后通过 [onPanelRequestConsumed] 通知调用方清空，
+     * 避免同一请求被重复消费导致用户手动关闭面板后又被弹回。
+     */
+    requestedPanel: String? = null,
+    onPanelRequestConsumed: () -> Unit = {},
 ) {
 
     // 同步当前路由到 ViewModel，ViewModel 据此决定注入哪些工具给 AI
@@ -195,6 +202,19 @@ fun CompanionSidebar(
 
     // 面板当前模式：null=自动根据 API 配置决定，其余为手动切换的面板
     var panelMode by remember { mutableStateOf<String?>(null) }
+
+    // 消费外部面板请求：设置页点"模型配置"时把侧边栏切到配置面板。
+    // 配置已存在时进"switch"（配置列表，可切换/编辑/新增）；
+    // 尚未配置时进"setup"（引导页，直接填 API Key）。
+    LaunchedEffect(requestedPanel) {
+        val target = requestedPanel ?: return@LaunchedEffect
+        val hasConfig = viewModel.currentProvider != null && viewModel.apiKey != null
+        panelMode = when (target) {
+            "config" -> if (hasConfig) "switch" else "setup"
+            else -> target
+        }
+        onPanelRequestConsumed()
+    }
 
     // 编辑模式时记住正在编辑的配置，从切换面板进入编辑页时设置
     var editingConfig by remember { mutableStateOf<SavedConfig?>(null) }
@@ -354,9 +374,9 @@ fun CompanionSidebar(
                     onBack = { panelMode = "switch" },
                     onAvatarClick = onAvatarClick,
                     editingConfig = editingConfig,
-                    onEditSave = { provider, apiKey, model, baseUrl ->
+                    onEditSave = { provider, apiKey, model, baseUrl, effort ->
                         editingConfig?.let { config ->
-                            viewModel.updateConfig(config.id, provider, apiKey, model, baseUrl)
+                            viewModel.updateConfig(config.id, provider, apiKey, model, baseUrl, effort)
                         }
                         editingConfig = null
                         panelMode = "switch"
@@ -399,7 +419,7 @@ private fun SetupContent(
     onBack: (() -> Unit)? = null,
     onAvatarClick: () -> Unit,
     editingConfig: SavedConfig? = null,
-    onEditSave: ((provider: ProviderConfig, apiKey: String, model: String, baseUrl: String) -> Unit)? = null,
+    onEditSave: ((provider: ProviderConfig, apiKey: String, model: String, baseUrl: String, effort: String?) -> Unit)? = null,
 ) {
     Column(
         modifier = Modifier
@@ -444,16 +464,18 @@ private fun SetupContent(
 
         // Provider 选择 + API Key 输入表单
         // 编辑模式时传入 initialConfig 预填充字段，保存时调用 onEditSave
+        // 传入 viewModel：拉取的模型目录同步到全局（发图前校验用）
         ApiProviderSetup(
             companionName = viewModel.companionName,
             initialConfig = editingConfig,
+            viewModel = viewModel,
             onSave = if (editingConfig != null && onEditSave != null) {
-                { provider, apiKey, model, baseUrl ->
-                    onEditSave(provider, apiKey, model, baseUrl)
+                { provider, apiKey, model, baseUrl, effort ->
+                    onEditSave(provider, apiKey, model, baseUrl, effort)
                 }
             } else {
-                { provider, apiKey, model, baseUrl ->
-                    viewModel.saveApiConfig(provider, apiKey, model, baseUrl)
+                { provider, apiKey, model, baseUrl, effort ->
+                    viewModel.saveApiConfig(provider, apiKey, model, baseUrl, effort)
                 }
             },
         )

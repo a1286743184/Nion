@@ -30,6 +30,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -128,6 +129,8 @@ fun SettingsScreen(
     onCustomThemeDelete: (String) -> Unit,
     onCustomThemeRename: (String, String) -> Unit,
     onOpenCompanion: () -> Unit = {},
+    /** 打开伙伴侧边栏并直达模型配置面板（Provider/API Key/模型/思考强度） */
+    onOpenModelConfig: () -> Unit = onOpenCompanion,
 ) {
     val context = LocalContext.current
     val app = context.applicationContext as android.app.Application
@@ -207,6 +210,20 @@ fun SettingsScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            // ── AI 模型配置入口 ──
+            // 模型配置界面实际位于伙伴侧边栏（Provider/API Key/模型/思考强度都在那里）。
+            // 此处提供直达入口：点击后打开侧边栏并切到配置面板，避免用户在设置页
+            // 找不到模型配置而以为功能缺失。
+            Text(
+                "AI 模型",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+            ModelConfigEntryCard(onOpenModelConfig = onOpenModelConfig)
+
+            Spacer(modifier = Modifier.height(8.dp))
+
             // ── 主题颜色区域（区域标题使用 secondary） ──
             Text(
                 "主题颜色",
@@ -380,6 +397,58 @@ fun SettingsScreen(
             DataManagementCard(context = context)
 
             Spacer(modifier = Modifier.height(16.dp))
+        }
+    }
+}
+
+/**
+ * AI 模型配置入口卡片 —— 点击后打开伙伴侧边栏并直达模型配置面板。
+ *
+ * 模型配置界面（Provider、API Key、模型列表、思考强度）实际位于伙伴侧边栏，
+ * 设置页本身不重复实现表单，只提供这条直达路径，避免用户在设置里翻不到。
+ *
+ * @param onOpenModelConfig 点击回调，由上层打开侧边栏并切到配置面板
+ */
+@Composable
+private fun ModelConfigEntryCard(onOpenModelConfig: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(MaterialTheme.shapes.medium)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) { onOpenModelConfig() },
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerLowest,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "模型配置",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    "Provider、API Key、模型与思考强度",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Icon(
+                LucideIcons.ChevronRight,
+                contentDescription = "打开模型配置",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+            )
         }
     }
 }

@@ -124,7 +124,7 @@ object ChatService {
     }
 
     /**
-     * 从 Provider API 获取可用模型列表。
+     * 从 Provider API 获取可用模型列表（仅 ID，向后兼容旧 UI）。
      *
      * @param provider Provider 配置
      * @param apiKey  API 密钥
@@ -133,7 +133,26 @@ object ChatService {
     suspend fun fetchModels(
         provider: ProviderConfig,
         apiKey: String,
-    ): Result<List<String>> = withContext(Dispatchers.IO) {
+    ): Result<List<String>> = fetchModelCatalog(provider, apiKey).map { list ->
+        list.map { it.id }
+    }
+
+    /**
+     * 从 Provider API 获取模型目录 —— 含每个模型的能力元数据。
+     *
+     * 兼容三类上游（字段解析见 [ModelCatalog]）：
+     * - 官方 OpenAI / DeepSeek：只返回 ID，元数据为空 → UI 不显示能力标签、不发送 effort
+     * - WB Switch relay / TWA：supported_efforts / default_effort / supports_image 等
+     * - Magpie：reasoning_levels / modalities.input 等
+     *
+     * @param provider Provider 配置（baseUrl 可为自定义中转站）
+     * @param apiKey   API 密钥
+     * @return 按上游返回顺序排列的模型元数据列表
+     */
+    suspend fun fetchModelCatalog(
+        provider: ProviderConfig,
+        apiKey: String,
+    ): Result<List<ModelMetadata>> = withContext(Dispatchers.IO) {
         try {
             val url = when (provider.apiType) {
                 ApiType.OPENAI_COMPATIBLE -> URL("${provider.baseUrl}/models")
@@ -162,12 +181,7 @@ object ChatService {
             }
 
             val responseText = connection.inputStream.bufferedReader().readText()
-            val json = JSONObject(responseText)
-            val models = json.getJSONArray("data").let { arr ->
-                (0 until arr.length()).map { i ->
-                    arr.getJSONObject(i).getString("id")
-                }
-            }
+            val models = ModelCatalog.parse(responseText)
             Result.success(models)
         } catch (e: Exception) {
             Result.failure(Exception("获取模型列表异常: ${e.message}", e))
@@ -335,11 +349,12 @@ object ChatService {
         model: String,
         messages: List<JSONObject>,
         currentRoute: String? = null,
+        reasoningEffort: String? = null,
     ): Result<ChatResponse> = withContext(Dispatchers.IO) {
         try {
             when (provider.apiType) {
-                ApiType.OPENAI_COMPATIBLE -> chatOpenAIWithTools(provider.baseUrl, apiKey, model, messages, currentRoute)
-                ApiType.ANTHROPIC -> chatAnthropicWithTools(provider.baseUrl, apiKey, model, messages, currentRoute)
+                ApiType.OPENAI_COMPATIBLE -> chatOpenAIWithTools(provider.baseUrl, apiKey, model, messages, currentRoute, reasoningEffort)
+                ApiType.ANTHROPIC -> chatAnthropicWithTools(provider.baseUrl, apiKey, model, messages, currentRoute, reasoningEffort)
             }
         } catch (e: Exception) {
             Result.failure(Exception("网络请求异常: ${e.message}", e))
@@ -369,12 +384,13 @@ object ChatService {
         model: String,
         messages: List<JSONObject>,
         currentRoute: String? = null,
+        reasoningEffort: String? = null,
         onTextDelta: (String) -> Unit,
     ): Result<ChatResponse> = withContext(Dispatchers.IO) {
         try {
             when (provider.apiType) {
-                ApiType.OPENAI_COMPATIBLE -> chatStreamOpenAI(provider.baseUrl, apiKey, model, messages, currentRoute, onTextDelta)
-                ApiType.ANTHROPIC -> chatStreamAnthropic(provider.baseUrl, apiKey, model, messages, currentRoute, onTextDelta)
+                ApiType.OPENAI_COMPATIBLE -> chatStreamOpenAI(provider.baseUrl, apiKey, model, messages, currentRoute, reasoningEffort, onTextDelta)
+                ApiType.ANTHROPIC -> chatStreamAnthropic(provider.baseUrl, apiKey, model, messages, currentRoute, reasoningEffort, onTextDelta)
             }
         } catch (e: Exception) {
             Result.failure(Exception("流式网络请求异常: ${e.message}", e))
@@ -408,6 +424,7 @@ object ChatService {
         model: String,
         messages: List<JSONObject>,
         currentRoute: String? = null,
+        reasoningEffort: String? = null,
         onTextDelta: (String) -> Unit,
     ): Result<ChatResponse> {
         val url = "$baseUrl/chat/completions"
@@ -416,7 +433,7 @@ object ChatService {
         val messagesArray = JSONArray().apply {
             for (msg in messages) put(msg)
         }
-        val bodyStr = buildStableOpenAIBody(model, messagesArray, getOpenAIToolsJson(currentRoute), stream = true)
+        val bodyStr = buildStableOpenAIBody(model, messagesArray, getOpenAIToolsJson(currentRoute), stream = true, reasoningEffort = reasoningEffort)
 
         Log.d("ChatService", "OpenAI stream request: ${bodyStr.take(500)}")
 
@@ -507,6 +524,7 @@ object ChatService {
         model: String,
         messages: List<JSONObject>,
         currentRoute: String? = null,
+        reasoningEffort: String? = null,
         onTextDelta: (String) -> Unit,
     ): Result<ChatResponse> {
         val url = "$baseUrl/messages"
@@ -534,6 +552,7 @@ object ChatService {
             toolsJson = getAnthropicToolsJson(currentRoute),
             stream = true,
             enableCacheControl = true,
+            reasoningEffort = reasoningEffort,
         )
 
         Log.d("ChatService", "Anthropic stream request: ${bodyStr.take(500)}")
@@ -884,6 +903,7 @@ object ChatService {
         model: String,
         messages: List<JSONObject>,
         currentRoute: String? = null,
+        reasoningEffort: String? = null,
     ): Result<ChatResponse> {
         val url = URL("$baseUrl/chat/completions")
         val connection = (url.openConnection() as HttpURLConnection).apply {
@@ -899,7 +919,7 @@ object ChatService {
         val messagesArray = JSONArray().apply {
             for (msg in messages) put(msg)
         }
-        val bodyStr = buildStableOpenAIBody(model, messagesArray, getOpenAIToolsJson(currentRoute), stream = false)
+        val bodyStr = buildStableOpenAIBody(model, messagesArray, getOpenAIToolsJson(currentRoute), stream = false, reasoningEffort = reasoningEffort)
 
         Log.d("ChatService", "OpenAI request body: ${bodyStr.take(2000)}")
 
@@ -976,6 +996,7 @@ object ChatService {
         model: String,
         messages: List<JSONObject>,
         currentRoute: String? = null,
+        reasoningEffort: String? = null,
     ): Result<ChatResponse> {
         val url = URL("$baseUrl/messages")
         val connection = (url.openConnection() as HttpURLConnection).apply {
@@ -1015,6 +1036,7 @@ object ChatService {
             toolsJson = getAnthropicToolsJson(currentRoute),
             stream = false,
             enableCacheControl = true,
+            reasoningEffort = reasoningEffort,
         )
 
         Log.d("ChatService", "Anthropic request body: ${bodyStr.take(2000)}")
@@ -1305,10 +1327,18 @@ object ChatService {
         messages: JSONArray,
         toolsJson: String,
         stream: Boolean,
+        reasoningEffort: String? = null,
     ): String {
         val sb = StringBuilder()
         sb.append("{\"model\":")
         sb.append(JSONObject.quote(model))
+        // 思考强度（透传上游目录声明的档位）：仅当用户明确选择时才发送，
+        // null = 跟随上游默认。放在 model 之后 tools 之前——同一配置下该值
+        // 恒定，不破坏 API 前缀缓存。
+        if (!reasoningEffort.isNullOrEmpty()) {
+            sb.append(",\"reasoning_effort\":")
+            sb.append(JSONObject.quote(reasoningEffort))
+        }
         // tools 放在 messages 前面：tools 稳定不变（~2500 tokens），放在前缀中始终命中缓存
         sb.append(",\"tools\":")
         sb.append(toolsJson)
@@ -1344,11 +1374,28 @@ object ChatService {
         toolsJson: String,
         stream: Boolean,
         enableCacheControl: Boolean = false,
+        reasoningEffort: String? = null,
     ): String {
         val sb = StringBuilder()
         sb.append("{\"model\":")
         sb.append(JSONObject.quote(model))
         sb.append(",\"max_tokens\":4096")
+
+        // 思考强度 → Anthropic thinking 参数：budget_tokens 按档位粗略映射
+        // （low=2k / medium=8k / high=16k / max=32k，未识别档位按 8k）。
+        // 开启 thinking 时 temperature/top_p 不可调（本就未发送，无冲突）。
+        if (!reasoningEffort.isNullOrEmpty()) {
+            val budget = when (reasoningEffort.lowercase()) {
+                "low", "minimal" -> 2048
+                "medium" -> 8192
+                "high" -> 16384
+                "max", "xhigh" -> 32768
+                else -> 8192
+            }
+            sb.append(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":")
+            sb.append(budget)
+            sb.append("}")
+        }
 
         // Anthropic Prompt Caching：system 以数组形式传入，附带 cache_control 标记
         // 非缓存模式：system 直接作为字符串传入
