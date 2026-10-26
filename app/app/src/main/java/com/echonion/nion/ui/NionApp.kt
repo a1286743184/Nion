@@ -161,6 +161,9 @@ fun NionApp() {
      */
     var pendingSettingsSection by remember { mutableStateOf<String?>(null) }
 
+    /** 排期卡「查看日程」要跳到的日期；日程页消费后清空 */
+    var pendingScheduleDate by remember { mutableStateOf<String?>(null) }
+
     // ── 处理来自通知栏的 Intent ──
     val activity = context as? MainActivity
     LaunchedEffect(activity?.pendingIntentAction) {
@@ -353,6 +356,25 @@ fun NionApp() {
                                 // 设置页点"模型配置"时置为 "config"，侧边栏消费后清空
                                 requestedPanel = pendingPanelRequest,
                                 onPanelRequestConsumed = { pendingPanelRequest = null },
+                                // 排期卡「查看日程」：先收起侧栏再切到日程页，
+                                // 返回时用户能回到原会话（会话状态保存在 ViewModel）
+                                onViewScheduleDate = { date ->
+                                    pendingScheduleDate = date
+                                    coroutineScope.launch { dualState.closeRight() }
+                                    navigateToRoute(navController, "schedule")
+                                },
+                                // 排期卡点任务：回任务页并展开该实体
+                                onOpenEntity = { taskId ->
+                                    coroutineScope.launch { dualState.closeRight() }
+                                    navigateToRoute(navController, "tasks")
+                                    pendingOpenEntityId = taskId
+                                },
+                                // 无时间窗时直达设置页「每日时间窗」
+                                onOpenTimeWindows = {
+                                    coroutineScope.launch { dualState.closeRight() }
+                                    pendingSettingsSection = "daily_time_windows"
+                                    navigateToRoute(navController, "settings")
+                                },
                             )
                         }
                     },
@@ -381,6 +403,8 @@ fun NionApp() {
                         composable("schedule") {
                             ScheduleRoute(
                                 onOpenCompanion = { dualState.openRight() },
+                                initialDate = pendingScheduleDate,
+                                onInitialDateConsumed = { pendingScheduleDate = null },
                             )
                         }
                         composable("pomodoro") {
@@ -647,8 +671,14 @@ private fun TasksRoute(
 @Composable
 private fun ScheduleRoute(
     onOpenCompanion: () -> Unit,
+    initialDate: String? = null,
+    onInitialDateConsumed: () -> Unit = {},
 ) {
-    ScheduleScreen(onOpenCompanion = onOpenCompanion)
+    ScheduleScreen(
+        onOpenCompanion = onOpenCompanion,
+        initialDate = initialDate,
+        onInitialDateConsumed = onInitialDateConsumed,
+    )
 }
 
 /**

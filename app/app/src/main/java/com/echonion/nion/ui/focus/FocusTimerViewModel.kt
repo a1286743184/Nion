@@ -104,6 +104,18 @@ class FocusTimerViewModel(private val app: Application, private val core: NionCo
         selectedTaskTitle = taskTitle
         if (duration != null) {
             focusMinutes = duration
+        } else {
+            // 未显式指定时长时，若任务有预计工时，按「剩余预计分钟、最多 60 分钟」预选（7.9）。
+            // 只是预选值，用户仍可修改，不会因为自动选择就立刻开始计时。
+            runCatching {
+                val task = core.getTask(taskId)
+                val expected = task.expectedMinutes
+                if (expected != null && expected > 0) {
+                    val doneMinutes = (task.focusSeconds / 60).toInt()
+                    val remaining = ((expected - doneMinutes).coerceAtLeast(1L))
+                    focusMinutes = minOf(remaining, 60L).toInt()
+                }
+            }
         }
         remainingSeconds = focusMinutes * 60
         needsProgressSnap = true

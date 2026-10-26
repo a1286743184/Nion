@@ -162,6 +162,11 @@ data class ChatMessage(
     val toolDone: Boolean = false,
     /** 消息携带的图片列表，每项含 base64 数据和 MIME 类型 */
     val images: List<ChatImage> = emptyList(),
+    /**
+     * 结构化 payload（当前仅排期建议）。随会话一起序列化，
+     * 重启后仍能看到同一张卡片；卡片不复用模型输出的 Markdown 表格。
+     */
+    val payload: ScheduleProposal? = null,
 )
 
 /**
@@ -193,6 +198,12 @@ fun CompanionSidebar(
      */
     requestedPanel: String? = null,
     onPanelRequestConsumed: () -> Unit = {},
+    /** 排期卡片「查看日程」：切到日程页对应日期（调用方负责收起侧栏与记录位置） */
+    onViewScheduleDate: ((String) -> Unit)? = null,
+    /** 排期卡片点击分配项 / 「去补充」：打开该任务详情 */
+    onOpenEntity: ((String) -> Unit)? = null,
+    /** 排期卡片无可用时间窗时：跳到设置页「每日时间窗」 */
+    onOpenTimeWindows: (() -> Unit)? = null,
 ) {
 
     // 同步当前路由到 ViewModel，ViewModel 据此决定注入哪些工具给 AI
@@ -385,6 +396,9 @@ fun CompanionSidebar(
                 else -> ChatContent(
                     viewModel = viewModel,
                     isVisible = isVisible,
+                    onViewScheduleDate = onViewScheduleDate,
+                    onOpenEntity = onOpenEntity,
+                    onOpenTimeWindows = onOpenTimeWindows,
                     onAvatarClick = onAvatarClick,
                     onNewChat = {
                         viewModel.startNewConversation()
@@ -2286,6 +2300,12 @@ private fun ChatContent(
     onNewChat: () -> Unit,
     onHistoryClick: () -> Unit,
     onSwitchClick: () -> Unit,
+    /** 排期卡「查看日程」：跳日程页对应日期 */
+    onViewScheduleDate: ((String) -> Unit)? = null,
+    /** 排期卡点任务 / 「去补充」：打开该实体 */
+    onOpenEntity: ((String) -> Unit)? = null,
+    /** 排期卡无时间窗：跳设置页每日时间窗 */
+    onOpenTimeWindows: (() -> Unit)? = null,
 ) {
     // 用 ViewModel 保存的滚动位置初始化 LazyListState
     // 当面板因打开左侧清单被移出组合再重新进入时，自动恢复到上次位置
@@ -2456,6 +2476,31 @@ private fun ChatContent(
                         animationSpec = tween(350),
                     ) else EnterTransition.None,
                 ) {
+                    // 结构化卡片消息（排期建议）：独立 surface，不放进 AI 气泡（7.10）
+                    val proposal = message.payload
+                    if (proposal != null) {
+                        ScheduleProposalCard(
+                            proposal = proposal,
+                            onApply = {
+                                // partial 之后的重试只处理未成功项
+                                viewModel.applyScheduleProposal(
+                                    proposal.proposalId,
+                                    retryOnlyFailed = proposal.status == ProposalStatus.PARTIAL,
+                                )
+                            },
+                            onViewSchedule = { date ->
+                                // 查看日程是用户主动行为：先记录位置再切页，不清空聊天
+                                onViewScheduleDate?.invoke(date)
+                            },
+                            onOpenTask = { taskId -> onOpenEntity?.invoke(taskId) },
+                            onExpandToggle = { expanded ->
+                                viewModel.setScheduleProposalExpanded(proposal.proposalId, expanded)
+                            },
+                            onFillMinutes = { taskId -> onOpenEntity?.invoke(taskId) },
+                            onOpenTimeWindows = { onOpenTimeWindows?.invoke() },
+                        )
+                        return@AnimatedVisibility
+                    }
                     MessageBubble(
                         message,
                         stickers = viewModel.stickers,

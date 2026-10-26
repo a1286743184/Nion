@@ -38,6 +38,8 @@ data class TaskStat(
     val taskId: String,
     val taskTitle: String,
     val seconds: Long,
+    /** 任务的预计总工时（分钟）；null = 未设置，展示为「实际 / 未设置」 */
+    val expectedMinutes: Long? = null,
 )
 
 /**
@@ -147,7 +149,10 @@ class FocusStatsViewModel(
 
                 // 任务分布
                 db.rawQuery(
-                    """SELECT s.task_id, COALESCE(t.name, '(已删除)') as name, SUM(s.seconds) as total
+                    // 同时带上任务的 expected_minutes，用于「实际 / 预计」对比
+                    // （7.9：不新增计时模型，直接复用实体字段）
+                    """SELECT s.task_id, COALESCE(t.name, '(已删除)') as name, SUM(s.seconds) as total,
+                              t.expected_minutes
                        FROM focus_sessions s
                        LEFT JOIN tasks t ON t.id = s.task_id
                        WHERE s.created_at >= date('now', '-' || ? || ' days')
@@ -161,6 +166,8 @@ class FocusStatsViewModel(
                                 taskId = cursor.getString(0),
                                 taskTitle = cursor.getString(1),
                                 seconds = cursor.getLong(2),
+                                // 列可为 NULL（未设置预计时长）
+                                expectedMinutes = if (cursor.isNull(3)) null else cursor.getLong(3),
                             )
                         )
                     }

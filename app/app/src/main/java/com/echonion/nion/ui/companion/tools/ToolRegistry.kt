@@ -45,6 +45,8 @@ object ToolRegistry {
         UpdateTool,
         DeleteTool,
         ManageTool,
+        // 排期（4.3）：先预览、确认后才写回 reminder
+        ScheduleTool,
         MemoryTool,
         MusicTool,
         WebSearchTool,

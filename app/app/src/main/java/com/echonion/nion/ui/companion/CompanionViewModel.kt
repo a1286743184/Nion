@@ -896,6 +896,9 @@ class CompanionViewModel(
                         }
                         put("images", imagesArr)
                     }
+                    // 结构化 payload（排期卡片）随消息一起序列化，
+                    // 重启后仍能看到同一张卡片，而不是退化成一串排版文本
+                    msg.payload?.let { put("payload", it.toJson()) }
                 })
             }
             val jsonStr = jsonArr.toString()
@@ -1000,6 +1003,8 @@ class CompanionViewModel(
                 isToolMessage = obj.optBoolean("isToolMessage", false),
                 toolDone = obj.optBoolean("toolDone", false),
                 images = images,
+                // 还原排期卡片；旧数据没有该字段时自然为 null，消息按普通文本渲染
+                payload = obj.optJSONObject("payload")?.let { ScheduleProposal.fromJson(it) },
             ))
         }
         return loaded
@@ -1814,6 +1819,178 @@ class CompanionViewModel(
     }
 
     /**
+     * 若工具结果是排期预览（confirmed=false 且有 assignments），追加一条结构化卡片消息。
+     *
+     * 数据来源是工具的结构化输出，不是模型重新排版的文本：
+     * assignments 带稳定任务 id 与 originalReminder，确认时直接回传，
+     * 不依赖标题匹配，也不会把模型改写过的内容当成写回依据。
+     *
+     * @param resultJson schedule 工具的原始返回 JSON 字符串
+     */
+    private fun appendScheduleProposalIfAny(resultJson: String) {
+        val obj = try {
+            JSONObject(resultJson)
+        } catch (_: Exception) {
+            return
+        }
+        // 确认后的结果（confirmed=true）不再生成新卡片，由已有卡片的按钮状态承载
+        if (obj.optBoolean("confirmed", false)) return
+        val arr = obj.optJSONArray("assignments") ?: return
+
+        val assignments = mutableListOf<ScheduleAssignment>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("id", "").takeIf { it.isNotEmpty() } ?: continue
+            assignments += ScheduleAssignment(
+                taskId = id,
+                title = o.optString("task", ""),
+                date = o.optString("date", ""),
+                start = o.optString("start", ""),
+                end = o.optString("end", ""),
+                minutes = o.optLong("minutes", 0),
+                originalReminder = o.optString("original_reminder", "").takeIf { it.isNotEmpty() },
+            )
+        }
+        val unplaced = mutableListOf<ScheduleUnplaced>()
+        obj.optJSONArray("unplaced")?.let { u ->
+            for (i in 0 until u.length()) {
+                val o = u.optJSONObject(i) ?: continue
+                unplaced += ScheduleUnplaced(
+                    taskId = o.optString("id", "").takeIf { it.isNotEmpty() },
+                    title = o.optString("task", ""),
+                    reason = o.optString("reason", ""),
+                )
+            }
+        }
+        // 既没有分配也没有未排入：说明工具什么也没算出来，不插入空卡片
+        if (assignments.isEmpty() && unplaced.isEmpty()) return
+
+        val proposal = ScheduleProposal(
+            proposalId = UUID.randomUUID().toString(),
+            createdAtEpochMs = System.currentTimeMillis(),
+            assignments = assignments,
+            unplaced = unplaced,
+            earliestCompletion = obj.optString("earliest_completion", "").takeIf { it.isNotEmpty() },
+            status = ProposalStatus.PREVIEW,
+        )
+        messages = messages + ChatMessage(
+            id = "schedule_${proposal.proposalId}",
+            text = "",
+            isFromUser = false,
+            timestamp = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm")),
+            payload = proposal,
+        )
+        // 结构化卡片已承载信息，立即请求持久化，避免重启后卡片丢失
+        requestSave()
+    }
+
+    /**
+     * 应用排期建议 —— 由卡片按钮直接触发，不要求模型再次生成结果（7.10）。
+     *
+     * 流程：状态置 CONFIRMING → 调用 schedule(confirm=true) 并回传已持久化的分配项
+     * → 按返回结果落到 APPLIED / PARTIAL / FAILED / STALE。
+     * 关闭侧栏不取消本流程（在 viewModelScope 中执行）；重复点击被 CONFIRMING 状态拦住。
+     *
+     * @param proposalId      目标卡片 ID
+     * @param retryOnlyFailed true = 只重试上次未成功的项（partial 后的重试入口）
+     */
+    fun applyScheduleProposal(proposalId: String, retryOnlyFailed: Boolean = false) {
+        val current = messages.find { it.payload?.proposalId == proposalId }?.payload ?: return
+        if (!current.canApply) return
+
+        // 重试只处理未成功项，不重放已成功的（避免覆盖用户在此期间的手动修改）
+        val targets = if (retryOnlyFailed) {
+            current.assignments.filter { it.taskId !in current.appliedIds }
+        } else {
+            current.assignments
+        }
+        if (targets.isEmpty()) return
+
+        updateProposal(proposalId) { it.copy(status = ProposalStatus.CONFIRMING) }
+
+        viewModelScope.launch {
+            val args = JSONObject().apply {
+                put("confirm", true)
+                put("assignments", JSONArray().apply {
+                    targets.forEach { a ->
+                        put(JSONObject().apply {
+                            put("id", a.taskId)
+                            put("task", a.title)
+                            put("date", a.date)
+                            put("start", a.start)
+                            put("end", a.end)
+                            // 带原值，工具层据此做过期校验，避免覆盖预览后的手动修改
+                            if (a.originalReminder != null) {
+                                put("original_reminder", a.originalReminder)
+                            }
+                        })
+                    }
+                })
+            }
+            val result = toolExecutor.execute("schedule", args.toString())
+            val obj = try {
+                JSONObject(result.data)
+            } catch (_: Exception) {
+                null
+            }
+            if (!result.success || obj == null) {
+                updateProposal(proposalId) { it.copy(status = ProposalStatus.FAILED) }
+                (app as NionApp).notifyDataChanged(setOf(DataType.TASK_DATA))
+                return@launch
+            }
+
+            val applied = mutableSetOf<String>()
+            obj.optJSONArray("applied")?.let { arr ->
+                for (i in 0 until arr.length()) applied += arr.optString(i)
+            }
+            val failed = mutableMapOf<String, String>()
+            obj.optJSONArray("failed")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    failed[o.optString("id", "")] = o.optString("reason", "写入失败")
+                }
+            }
+
+            updateProposal(proposalId) { p ->
+                p.copy(
+                    // 累积已应用集合：partial 重试后，前一次成功的仍算成功
+                    appliedIds = p.appliedIds + applied,
+                    failedReasons = failed,
+                    status = when {
+                        // 出现过期项:明确标 stale，即便其它项写成功也不假装全部正常
+                        failed.values.any { it.contains("已变化") } -> ProposalStatus.STALE
+                        applied.isEmpty() -> ProposalStatus.FAILED
+                        failed.isEmpty() -> ProposalStatus.APPLIED
+                        else -> ProposalStatus.PARTIAL
+                    },
+                )
+            }
+            // 应用成功让列表/日程/统计立刻反映新时间
+            (app as NionApp).notifyDataChanged(setOf(DataType.TASK_DATA))
+        }
+    }
+
+    /**
+     * 更新某个排期卡片的数据（按 proposalId 定位）。
+     *
+     * 只改动目标消息，其余消息保持引用不变，避免整个对话列表重组。
+     */
+    private fun updateProposal(proposalId: String, transform: (ScheduleProposal) -> ScheduleProposal) {
+        messages = messages.map { msg ->
+            val p = msg.payload
+            if (p != null && p.proposalId == proposalId) msg.copy(payload = transform(p)) else msg
+        }
+        requestSave()
+    }
+
+    /**
+     * 展开/收起排期卡片（展开状态随会话持久化，重开侧栏保持原样）。
+     */
+    fun setScheduleProposalExpanded(proposalId: String, expanded: Boolean) {
+        updateProposal(proposalId) { it.copy(expanded = expanded) }
+    }
+
+    /**
      * 更新已有的工具状态消息文本（执行完成后改为结果描述）。
      * @param toolCallId 工具调用 ID
      * @param text 新的状态文本
@@ -2016,6 +2193,13 @@ class CompanionViewModel(
                     val resultText = toolResultText(call.name, call.arguments, toolResult)
                     updateToolStatusMessage(call.id, resultText)
                     appendToolResultMessage(call.id, toolResult.data)
+
+                    // 排期预览 → 插入结构化卡片（7.10）。
+                    // 只在真的拿到完整结构化结果时插入；模型自己写的 Markdown 表格
+                    // 一律不作为卡片与写回依据。
+                    if (toolResult.success) {
+                        appendScheduleProposalIfAny(toolResult.data)
+                    }
 
                     // 等待一个渲染帧，让用户看到"已完成"的状态再继续下一个工具
                     delay(50)
@@ -2381,6 +2565,17 @@ class CompanionViewModel(
                 append("\n\n")
                 append(promptFormat)
             }
+            // 记忆工具的触发规则（4.4）：工具本身与注入链路都已存在，
+            // 缺的是系统提示词里的行为规则 —— 只写在工具 description 里模型基本不会主动调用。
+            // 措辞刻意收紧（「稳定偏好 / 日程习惯 / 身份事实 / 明确要求记住」），
+            // 避免模型每轮都记一条造成噪音。
+            append(
+                "\n\n---\n记忆规则：当用户在对话中透露稳定的偏好、日程习惯、身份事实，" +
+                    "或明确要求你记住某事时，先调用 memory 工具记录，再继续回复。" +
+                    "同类记忆优先用 update 修改已有条目，不要重复新增。" +
+                    "普通的寒暄、一次性的临时安排、你已经能从上下文推断的信息不要记录。"
+            )
+
             // 注入用户偏好记录（AI 通过 remember 工具和 UI 手动添加的偏好）
             // 按 id 排序后再遍历，保证每次请求生成的提示词文本完全一致，命中 API Prefix Caching
             if (userPreferences.length() > 0) {

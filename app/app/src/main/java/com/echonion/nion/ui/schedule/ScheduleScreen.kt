@@ -47,6 +47,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -103,7 +104,19 @@ val dayLabels = listOf("一", "二", "三", "四", "五", "六", "日")
 fun ScheduleScreen(
     viewModel: ScheduleViewModel = scheduleViewModel(),
     onOpenCompanion: () -> Unit = {},
+    /** 外部请求打开某一天（排期卡「查看日程」），"YYYY-MM-DD" */
+    initialDate: String? = null,
+    /** initialDate 已消费 */
+    onInitialDateConsumed: () -> Unit = {},
 ) {
+    // 排期卡跳转：切到指定日期并消费请求（只生效一次）
+    LaunchedEffect(initialDate) {
+        val raw = initialDate ?: return@LaunchedEffect
+        runCatching { java.time.LocalDate.parse(raw) }
+            .getOrNull()
+            ?.let { viewModel.selectDate(it) }
+        onInitialDateConsumed()
+    }
     var showCalendarPicker by remember { mutableStateOf(false) }
     /** 当前展开的任务详情 ID，null 表示显示任务列表 */
     var expandedTaskId by remember { mutableStateOf<String?>(null) }

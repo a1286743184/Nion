@@ -236,7 +236,11 @@ fun FocusStatsPanel(
                                 TaskBarRow(
                                     title = item.taskTitle,
                                     seconds = item.seconds,
-                                    maxSeconds = state.taskBreakdown.maxOfOrNull { it.seconds }?.coerceAtLeast(1L) ?: 1L,
+                                    // 有预计时长的任务，进度条按「实际/预计」上限归一，
+                                    // 否则按本组最大值归一（两种口径不能混用，否则横条无法横向比较）
+                                    maxSeconds = item.expectedMinutes?.let { (it * 60).coerceAtLeast(1L) }
+                                        ?: (state.taskBreakdown.maxOfOrNull { it.seconds }?.coerceAtLeast(1L) ?: 1L),
+                                    expectedMinutes = item.expectedMinutes,
                                 )
                             }
                         }
@@ -499,6 +503,8 @@ private fun TaskBarRow(
     title: String,
     seconds: Long,
     maxSeconds: Long,
+    /** 预计总工时（分钟）；null 时文字显示「实际 / 未设置」 */
+    expectedMinutes: Long? = null,
 ) {
     val fraction = if (maxSeconds > 0) seconds.toFloat() / maxSeconds.toFloat() else 0f
 
@@ -537,13 +543,17 @@ private fun TaskBarRow(
 
         Spacer(modifier = Modifier.width(8.dp))
 
-        // 时长文字，固定宽度保证柱状图起始位置对齐（与 DailyBarRow 一致）
+        // 时长文字：有预计时显示「实际 / 预计」，否则只显示实际（7.9）。
+        // 固定宽度改为自适应：带预计的文案更长，宁可换行也不截断关键信息。
         Text(
-            formatDuration(seconds),
+            text = if (expectedMinutes != null) {
+                "${formatDuration(seconds)} / ${expectedMinutes}分"
+            } else {
+                formatDuration(seconds)
+            },
             style = MaterialTheme.typography.bodySmall,
             fontWeight = FontWeight.Medium,
             color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.width(52.dp),
         )
     }
 }
