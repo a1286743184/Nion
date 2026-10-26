@@ -172,6 +172,31 @@ fun TaskScreen(
     // 笔记搜索关键词：null=不搜索，非空=按关键词过滤笔记列表
     var noteSearchQuery by remember { mutableStateOf<String?>(null) }
 
+    /**
+     * 详情返回栈（7.5）：从详情的子项 / 关联笔记继续深入时，把来源实体压栈。
+     * 系统返回优先弹栈回上一级，栈空才关闭浮层 —— 否则用户从任务点进笔记后
+     * 一按返回就直接回到列表，「沿来路返回」的连续性断掉。
+     */
+    val detailBackStack = remember { mutableStateListOf<String>() }
+    // 关联笔记选择器是否打开
+    var showLinkPicker by remember { mutableStateOf(false) }
+    // 长按操作菜单是否打开（7.7）
+    var showActionsSheet by remember { mutableStateOf(false) }
+    // 待确认删除的实体（选中后先收起菜单再弹确认框）
+    var pendingDelete by remember { mutableStateOf<TaskItem?>(null) }
+    // 操作菜单当前目标实体（长按原地松手时设置）
+    var actionTarget by remember { mutableStateOf<TaskItem?>(null) }
+    // 删除执行中（防重复提交，按钮禁用）
+    var deleting by remember { mutableStateOf(false) }
+    // 操作菜单里「更改分组」所需的临时分组列表（按所选清单加载）
+    var actionGroups by remember { mutableStateOf<List<GroupItem>>(emptyList()) }
+    // 关联选择器的候选笔记（打开对话框时才加载，避免每次进列表页都全表查）
+    var linkCandidates by remember { mutableStateOf<List<TaskItem>>(emptyList()) }
+    // 打开关联选择器时异步加载候选；关闭时清空避免陈旧数据
+    LaunchedEffect(showLinkPicker) {
+        linkCandidates = if (showLinkPicker) viewModel.allNotesForLink() else emptyList()
+    }
+
     // ===== 附件相关状态 =====
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -210,10 +235,15 @@ fun TaskScreen(
         }
     }
 
-    // 当任务详情打开时，加载该任务的附件列表
+    // 当详情打开时，加载附件与双向关联（任务看关联笔记，笔记看关联任务）
     LaunchedEffect(expandedTaskId) {
-        if (expandedTaskId != null) {
-            detailAttachments = viewModel.getAttachments(expandedTaskId!!)
+        val id = expandedTaskId
+        if (id != null) {
+            detailAttachments = viewModel.getAttachments(id)
+            // 双向关联各加载一侧：详情页展示「关联笔记」，
+            // 笔记编辑器展示「关联任务」，同一个实体两种视角都能看到关系
+            viewModel.loadLinkedNotes(id)
+            viewModel.loadLinkedTasks(id)
         } else {
             detailAttachments = emptyList()
         }
@@ -239,6 +269,27 @@ fun TaskScreen(
     )
 
     /**
+     * 把某个实体的子孙拍平成带深度的节点列表，供详情页子项树渲染。
+     *
+     * 深度在这里一次算完（O(n)），避免每一行都去反查 parentId（那会是 O(n²)）。
+     * 顺序保持原树序（父在前、子紧随），符合用户对层级的直觉。
+     *
+     * @param root 当前详情实体
+     * @return 拍平后的子孙节点列表（不含 root 自身）；直接子项 depth=1
+     */
+    fun childNodesOf(root: TaskItem): List<ChildNode> {
+        val result = mutableListOf<ChildNode>()
+        fun walk(children: List<TaskItem>, depth: Int) {
+            for (child in children) {
+                result += ChildNode(child, depth)
+                if (child.subtasks.isNotEmpty()) walk(child.subtasks, depth + 1)
+            }
+        }
+        walk(root.subtasks, 1)
+        return result
+    }
+
+    /**
      * 递归从任务树中按 ID 查找任务。
      * 用于在 AnimatedContent 的 detail 分支中获取被展开任务的完整数据。
      */
@@ -251,9 +302,14 @@ fun TaskScreen(
         return null
     }
 
-    // 任务详情 overlay 返回拦截：expandedTaskId 非空时，系统返回手势关闭详情而非退出页面
+    // 任务详情 overlay 返回拦截：先沿返回栈回上一级，栈空才关闭详情（7.15 返回优先级）
     BackHandler(enabled = expandedTaskId != null) {
-        expandedTaskId = null
+        if (detailBackStack.isNotEmpty()) {
+            // 弹栈：回到来源实体，保持详情容器不关闭
+            expandedTaskId = detailBackStack.removeAt(detailBackStack.lastIndex)
+        } else {
+            expandedTaskId = null
+        }
     }
     // 添加任务 overlay 返回拦截
     BackHandler(enabled = showAddSheet) {
@@ -324,7 +380,19 @@ fun TaskScreen(
                                     )
                                 },
                             ),
-                            onDismiss = { expandedTaskId = null },
+                            onDismiss = {
+                                // 返回沿来路：从任务详情进来的笔记编辑器，关闭后回到任务详情
+                                if (detailBackStack.isNotEmpty()) {
+                                    expandedTaskId = detailBackStack.removeAt(detailBackStack.lastIndex)
+                                } else {
+                                    expandedTaskId = null
+                                }
+                            },
+                            onOpenLinkedTask = { linkedTaskId ->
+                                // 打开关联任务：记录来源笔记，返回时恢复编辑器
+                                detailBackStack.add(taskId)
+                                expandedTaskId = linkedTaskId
+                            },
                         )
                     }
                 } else {
@@ -378,6 +446,29 @@ fun TaskScreen(
                             }
                         },
                         onPreviewImage = { previewAttachment = it },
+                        /** 预计时长变更：null 表示清除 */
+                        onUpdateExpectedMinutes = { minutes ->
+                            viewModel.updateExpectedMinutes(taskId, minutes)
+                        },
+                        /** 子项树：直接子项 + 更深层级，按 parentId 一次性算好深度 */
+                        descendants = childNodesOf(task),
+                        /** 关联笔记：由 ViewModel 在打开详情时查出 */
+                        linkedNotes = viewModel.linkedNotes.filter { it.id != taskId },
+                        onOpenChild = { childId ->
+                            // 同一浮层内切到子实体（7.5）：把目标 ID 压栈后更新当前展开项
+                            detailBackStack.add(taskId)
+                            expandedTaskId = childId
+                        },
+                        onOpenLinkedNote = { noteId ->
+                            // 打开关联笔记：记录来源任务，返回时恢复详情
+                            detailBackStack.add(taskId)
+                            expandedTaskId = noteId
+                        },
+                        onUnlinkNote = { noteId ->
+                            viewModel.unlinkNoteFromTask(noteId, taskId)
+                        },
+                        onAddLink = { showLinkPicker = true },
+                        onOpenActions = { showActionsSheet = true },
                     )
                     }
                 }
@@ -396,6 +487,11 @@ fun TaskScreen(
                             dualState = dualState,
                             viewModel = viewModel,
                             onTaskClick = { expandedTaskId = it.id },
+                            // 长按原地松手 → 记下目标并打开操作菜单（拖动排序不受影响）
+                            onLongPressAction = { target ->
+                                actionTarget = target
+                                showActionsSheet = true
+                            },
                             taskSharedModifier = { targetId ->
                                 Modifier.sharedElement(
                                     sharedContentState = rememberSharedContentState("task_detail_$targetId"),
@@ -497,6 +593,75 @@ fun TaskScreen(
                         )
                     }
 
+                    // ── 长按操作菜单（7.7）──
+                    actionTarget?.let { target ->
+                        EntityActionsSheet(
+                            task = target,
+                            // 智能清单是聚合视图，不能作为移动目标，因此只列真实清单
+                            checklists = viewModel.checklists,
+                            currentGroups = actionGroups,
+                            onRequestGroups = { checklistId ->
+                                // 切换目标清单时同步加载它的分组，避免按旧清单的分组移动
+                                scope.launch {
+                                    actionGroups = viewModel.groupsOf(checklistId)
+                                }
+                            },
+                            onMove = { checklistId, groupId ->
+                                viewModel.moveEntity(target.id, checklistId, groupId)
+                                actionTarget = null
+                            },
+                            onSwitchKind = { newKind ->
+                                viewModel.switchKind(target.id, newKind)
+                                actionTarget = null
+                            },
+                            onEnterSelectionMode = {
+                                viewModel.toggleSelection(target.id)
+                            },
+                            onDelete = {
+                                // 先收菜单再弹确认（不叠两个弹窗）
+                                actionTarget = null
+                                pendingDelete = target
+                            },
+                            onDismiss = { actionTarget = null },
+                        )
+                    }
+
+                    // ── 删除确认（7.7 删除保护）──
+                    pendingDelete?.let { target ->
+                        DeleteEntityDialog(
+                            task = target,
+                            childCount = target.subtasks.size,
+                            deleting = deleting,
+                            onConfirm = {
+                                deleting = true
+                                viewModel.deleteEntity(target.id)
+                                // 删除是异步的：立刻关闭弹窗与详情，失败由 Snackbar 提示
+                                deleting = false
+                                pendingDelete = null
+                                if (expandedTaskId == target.id) expandedTaskId = null
+                            },
+                            onDismiss = { pendingDelete = null },
+                        )
+                    }
+
+                    // ── 详情页「关联笔记」选择器（7.5）──
+                    if (showLinkPicker) {
+                        // 只列 kind=note 的实体，并预勾选已关联项
+                        val linkedIds = viewModel.linkedNotes.map { it.id }.toSet()
+                        com.echonion.nion.ui.notebook.LinkItemDialog(
+                            title = "关联笔记",
+                            items = linkCandidates,
+                            linkedIds = linkedIds,
+                            onLink = { noteId ->
+                                expandedTaskId?.let { viewModel.linkNoteToTask(noteId, it) }
+                            },
+                            onUnlink = { noteId ->
+                                expandedTaskId?.let { viewModel.unlinkNoteFromTask(noteId, it) }
+                            },
+                            onDismiss = { showLinkPicker = false },
+                        )
+                    }
+
                     // 添加笔记浮层（笔记型清单）
                     AnimatedVisibility(
                         visible = showAddNote,
@@ -554,6 +719,8 @@ private fun TaskScreenContent(
     reorderableItems: SnapshotStateList<FlatTaskItem>,
     /** 笔记模式：true 时列表标题显示"笔记"，SharedTaskCard 显示笔记图标 */
     isNotebook: Boolean = false,
+    /** 长按原地松手：打开该实体的操作菜单（7.7 手势仲裁） */
+    onLongPressAction: ((TaskItem) -> Unit)? = null,
 ) {
     // ============ 完成动画协调状态 ============
     // animatingDoneIds：正在播放完成动画的任务 ID。
@@ -735,6 +902,7 @@ private fun TaskScreenContent(
                         modifier = Modifier.weight(1f),
                         onToggleCollapse = { viewModel.toggleCollapse(it) },
                         isNotebook = isNotebook,
+                        onLongPressAction = onLongPressAction,
                         // 完成动画协调参数：由上面的状态集合驱动
                         playCompletionAnimIds = playCompletionAnimIds,
                         burstTaskIds = burstTaskIdSet,
@@ -936,7 +1104,8 @@ private fun ExpectedMinutesRow(
     }
 
     if (showSheet) {
-        ExpectedMinutesSheet(
+        // 复用公共抽屉：新建表单与详情页共享同一套校验规则
+        ExpectedMinutesPickerSheet(
             current = minutes,
             onConfirm = {
                 onMinutesChange(it)
@@ -947,117 +1116,6 @@ private fun ExpectedMinutesRow(
     }
 }
 
-/**
- * 预计时长选择抽屉 —— 15/25/45/60/90 快捷选项 + 自定义正整数 + 清除（7.9）。
- *
- * 校验：只接受正整数；0、负数、非数字都禁止保存（按钮置灰并给出提示）。
- *
- * @param current   当前值，null = 未设置
- * @param onConfirm 确认回调；传 null 表示清除
- * @param onDismiss 关闭回调
- */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun ExpectedMinutesSheet(
-    current: Long?,
-    onConfirm: (Long?) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    // 选中的值：null 表示「未设置」，与「清除」等价
-    var selected by remember { mutableStateOf(current) }
-    // 自定义输入框的文本；非空且合法时优先于快捷选项
-    var customText by remember { mutableStateOf("") }
-    val customValue = customText.trim().toLongOrNull()
-    // 自定义输入非法（有输入但不是正整数）时禁止保存
-    val customInvalid = customText.isNotBlank() && (customValue == null || customValue <= 0)
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        containerColor = MaterialTheme.colorScheme.surface,
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp)
-                .padding(bottom = 32.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Text(
-                "预计时长",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-            )
-            Text(
-                "这是预计总工作量，不会限制你的专注计时。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            // 快捷选项：两行流式排布，触摸区高度 40dp + 外层间距补足 48dp
-            androidx.compose.foundation.layout.FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                listOf(15L, 25L, 45L, 60L, 90L).forEach { preset ->
-                    val isSelected = customText.isBlank() && selected == preset
-                    Surface(
-                        modifier = Modifier
-                            .height(40.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .clickable(
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null,
-                                onClick = {
-                                    selected = preset
-                                    customText = ""
-                                },
-                            ),
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (isSelected) MaterialTheme.colorScheme.secondaryContainer
-                        else MaterialTheme.colorScheme.surfaceContainerHigh,
-                    ) {
-                        Box(
-                            modifier = Modifier.padding(horizontal = 16.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                "$preset 分钟",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = if (isSelected) MaterialTheme.colorScheme.onSecondaryContainer
-                                else MaterialTheme.colorScheme.onSurface,
-                            )
-                        }
-                    }
-                }
-            }
-            OutlinedTextField(
-                value = customText,
-                onValueChange = { input ->
-                    // 只允许数字，避免用户输入字母后拿到莫名其妙的错误
-                    customText = input.filter { it.isDigit() }.take(4)
-                },
-                label = { Text("自定义（分钟）") },
-                isError = customInvalid,
-                supportingText = if (customInvalid) {
-                    { Text("请输入大于 0 的整数分钟") }
-                } else null,
-                singleLine = true,
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Button(
-                onClick = { onConfirm(customValue ?: selected) },
-                enabled = !customInvalid,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-            ) { Text("保存") }
-            // 清除入口：与保存分开，避免误把「保存空值」当成清除
-            TextButton(
-                onClick = { onConfirm(null) },
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("清除") }
-        }
-    }
-}
 
 /**
  * 新建笔记浮层 —— 从 FAB 位置 morph 展开为居中的笔记创建表单。

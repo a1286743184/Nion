@@ -1,5 +1,7 @@
 package com.echonion.nion.ui.notebook
 
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -79,6 +81,8 @@ fun NotebookEditor(
     /** shared element 动画 modifier：与列表中的笔记卡片共享 bounds，实现打开放大/关闭缩回的 morph 动画 */
     sharedElementModifier: Modifier,
     onDismiss: () -> Unit,
+    /** 点击关联任务 chip 主体：打开任务详情（7.7）。默认空实现，避免强制所有调用方改签名 */
+    onOpenLinkedTask: (String) -> Unit = {},
 ) {
     // 正文使用 rememberSaveable，确保屏幕旋转等配置变更时内容不丢失
     var content by rememberSaveable(note.id) { mutableStateOf(note.description ?: "") }
@@ -128,18 +132,13 @@ fun NotebookEditor(
                         .fillMaxWidth()
                         .background(MaterialTheme.colorScheme.surfaceContainer),
                 ) {
-                    // 取状态栏高度的约 60% 作为顶部间距（不是全量 statusBarsPadding），
-                    // 让标题更贴近屏幕顶部但仍避开状态栏图标
-                    val density = LocalDensity.current
-                    val compactTopPad = with(density) {
-                        (WindowInsets.statusBars.getTop(density) * 3 / 5).toDp()
-                    }
-                    // 标题行：用 Box 替代 IconButton 消除 48dp 最小触摸目标限制
-                    // Row 实际高度由 Box(32dp) 决定，标题中心仅离屏幕顶 compactTopPad + 16dp
+                    // 顶部间距用完整状态栏高度（7.8）：之前的「60% 折减」是刻意压缩视觉，
+                    // 结果是标题贴着状态栏，大字体/刘海屏下更容易撞上系统图标。
+                    // 返回与编辑/预览按钮保留足够触摸区，不用缩小 Box 换紧凑。
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(top = compactTopPad)
+                            .statusBarsPadding()
                             .padding(start = 4.dp, end = 16.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -214,6 +213,7 @@ fun NotebookEditor(
                         linkedTasks = linkedTasks,
                         onAddLink = { showLinkDialog = true },
                         onUnlinkTask = onUnlinkTask,
+                        onOpenLinkedTask = onOpenLinkedTask,
                     )
                 }
             },
@@ -319,6 +319,8 @@ private fun LinkedTasksBar(
     linkedTasks: List<TaskItem>,
     onAddLink: () -> Unit,
     onUnlinkTask: (String) -> Unit,
+    /** 点击 chip 主体：打开该任务详情（7.7：一触即删改为点开） */
+    onOpenLinkedTask: (String) -> Unit = {},
 ) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainer,
@@ -335,7 +337,10 @@ private fun LinkedTasksBar(
             linkedTasks.take(3).forEach { task ->
                 LinkedTaskChip(
                     taskName = task.name.ifBlank { "无标题任务" },
-                    onClick = { onUnlinkTask(task.id) },
+                    // 短按只负责打开任务详情（7.7）：一触即删是误触高发点
+                    onClick = { onOpenLinkedTask(task.id) },
+                    // 右侧独立 X（48dp 触摸区）才解除关联
+                    onUnlink = { onUnlinkTask(task.id) },
                 )
             }
             // 超过 3 个时显示可点击的 "+N" 标签，点击打开关联选择器
@@ -394,29 +399,63 @@ private fun LinkedTasksBar(
 private fun LinkedTaskChip(
     taskName: String,
     onClick: () -> Unit,
+    onUnlink: () -> Unit,
 ) {
     Surface(
-        onClick = onClick,
         shape = RoundedCornerShape(8.dp),
         color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = NionAlpha.BG_SUBTLE),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            modifier = Modifier.padding(start = 8.dp, end = 0.dp, top = 0.dp, bottom = 0.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            Icon(
-                LucideIcons.ClipboardList,
-                contentDescription = null,
-                modifier = Modifier.size(12.dp),
-                tint = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
-            Text(
-                taskName,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-                maxLines = 1,
-            )
+            // 左侧区域（图标 + 名称）点击打开任务详情
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onClick,
+                    )
+                    // 竖向 padding 补足 32dp 视觉高度；整条 chip 命中区仍 >= 32dp
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Icon(
+                    LucideIcons.ClipboardList,
+                    contentDescription = null,
+                    modifier = Modifier.size(12.dp),
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                Text(
+                    taskName,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    maxLines = 1,
+                )
+            }
+            // 独立解除关联：48dp 触摸区，不与会打开详情的主区域重叠
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onUnlink,
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    LucideIcons.X,
+                    contentDescription = "取消关联「$taskName」",
+                    modifier = Modifier.size(12.dp),
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
         }
     }
 }

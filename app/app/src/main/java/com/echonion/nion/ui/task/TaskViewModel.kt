@@ -759,6 +759,134 @@ class TaskViewModel(
     }
 
     /**
+     * 更新任务的预计总工作量（分钟）。
+     *
+     * 与「专注计时」无关：expected_minutes 只表达预计投入，不会自动开始计时、
+     * 也不产生结束时间字段（点任务原则）。
+     *
+     * @param id      实体 ID
+     * @param minutes 预计分钟数；null 表示清除
+     */
+    fun updateExpectedMinutes(id: String, minutes: Long?) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    core.updateTaskFull(
+                        id = id,
+                        name = null, description = null, priority = null, status = null,
+                        kind = null, expectedMinutes = minutes,
+                        // 传 null 时用清除标志位，否则 update_task_full 会把它当成「不修改」
+                        clearExpectedMinutes = minutes == null,
+                        categoryId = null,
+                        setGroup = false, groupId = null,
+                        setParent = false, parentId = null,
+                        reminder = null, clearReminder = false,
+                        recurrenceRule = null, recurrenceReminderTime = null,
+                    )
+                }
+                tasks = loadTasksForCurrentView()
+            } catch (e: Exception) {
+                onError("保存预计时长失败: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 实体类型互转（task ↔ note）。
+     *
+     * 互转只改 kind：内容、关联、专注记录、附件全部跟随实体保留（7.2）。
+     * task→note 时 completed_at 保留，转回 task 后能恢复已完成状态显示。
+     *
+     * @param id      实体 ID
+     * @param newKind 目标类型 "task" / "note"
+     */
+    fun switchKind(id: String, newKind: String) {
+        val snapshot = tasks
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    core.updateTaskFull(
+                        id = id,
+                        name = null, description = null, priority = null, status = null,
+                        kind = newKind, expectedMinutes = null, clearExpectedMinutes = false,
+                        categoryId = null,
+                        setGroup = false, groupId = null,
+                        setParent = false, parentId = null,
+                        reminder = null, clearReminder = false,
+                        recurrenceRule = null, recurrenceReminderTime = null,
+                    )
+                }
+                tasks = loadTasksForCurrentView()
+                scheduleRefreshCounts()
+            } catch (e: Exception) {
+                // 乐观更新失败回滚：不改实体但列表已重载，确保 UI 与库一致
+                tasks = snapshot
+                onError("转换失败: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 移动实体到目标清单（可选同时改分组）。
+     *
+     * 一次 update_task_full 调用提交，避免「清单改了、分组没改」的中间态。
+     * 目标清单没有对应分组时调用方应传 null，让实体落到「未分组」。
+     *
+     * @param id          实体 ID
+     * @param checklistId 目标清单 ID
+     * @param groupId     目标分组 ID；null = 未分组
+     */
+    fun moveEntity(id: String, checklistId: String, groupId: String?) {
+        val snapshot = tasks
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    core.updateTaskFull(
+                        id = id,
+                        name = null, description = null, priority = null, status = null,
+                        kind = null, expectedMinutes = null, clearExpectedMinutes = false,
+                        categoryId = checklistId,
+                        // setGroup=true + groupId=null 表示「清除分组」，与「不改分组」区分开
+                        setGroup = true, groupId = groupId,
+                        setParent = false, parentId = null,
+                        reminder = null, clearReminder = false,
+                        recurrenceRule = null, recurrenceReminderTime = null,
+                    )
+                }
+                tasks = loadTasksForCurrentView()
+                scheduleRefreshCounts()
+            } catch (e: Exception) {
+                tasks = snapshot
+                onError("未保存：${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 删除实体并让它被删除的直接子项上移一级（7.7）。
+     *
+     * 原子性由 core 事务保证：删除、子项改挂、关联清理要么全成要么全不发生。
+     * 失败时回滚列表快照并提示重试，不把失败包装成成功。
+     *
+     * @param id 实体 ID
+     */
+    fun deleteEntity(id: String) {
+        val snapshot = tasks
+        tasks = removeTaskFromList(tasks, id)
+        ReminderScheduler.cancelReminder(app, id)
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { core.deleteTask(id) }
+                tasks = loadTasksForCurrentView()
+                scheduleRefreshCounts()
+            } catch (e: Exception) {
+                tasks = snapshot
+                onError("删除失败，请重试：${e.message}")
+            }
+        }
+    }
+
+    /**
      * 更新任务字段（标题、描述、优先级）。
      * 所有参数均为可选，仅非 null 参数会被更新。
      */
@@ -1253,6 +1381,23 @@ class TaskViewModel(
         private set
 
     /**
+     * 读取指定清单下的分组（不改变当前活跃分组状态）。
+     *
+     * 用于「移动实体」菜单：目标清单可能不是当前清单，
+     * 需要一份独立的、不影响主列表的临时分组列表。
+     *
+     * @param checklistId 清单 ID
+     * @return 分组 UI 模型列表；读取失败返回空列表（调用方按「未分组」处理）
+     */
+    suspend fun groupsOf(checklistId: String): List<GroupItem> {
+        return try {
+            withContext(Dispatchers.IO) { core.getGroupsByChecklist(checklistId).map { it.toUi() } }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
      * 加载指定任务关联的所有笔记。
      * @param taskId 任务 ID
      */
@@ -1356,16 +1501,25 @@ class TaskViewModel(
     }
 
     /**
+     * 关联选择器用的笔记列表（同步快照）。
+     *
+     * 与 [getAllNotes] 的区别：这里直接同步返回已加载的清单下的笔记，
+     * 供 Compose 在对话框打开时按需取用；仍按实体 kind=note 过滤，
+     * 而不是按清单类型 —— 任务型清单里的笔记也要能被关联。
+     */
+    suspend fun allNotesForLink(): List<TaskItem> = getAllNotes()
+
+    /**
      * 获取所有笔记型清单中的笔记（用于关联选择器）。
      * @return 所有笔记列表
      */
     suspend fun getAllNotes(): List<TaskItem> {
         return try {
             withContext(Dispatchers.IO) {
-                // 遍历所有笔记型清单，加载其中的笔记
-                checklists.filter { it.checklistType == "notebook" }.flatMap { cl ->
-                    core.getTasksByCategory(cl.id, null).map { it.toUi() }
-                }
+                // 按实体 kind 枚举笔记（不再按清单类型推导）：
+                // 任务型清单里的笔记、收集箱里的笔记都能被关联到。
+                // include_children=true 让子笔记也进入候选。
+                core.searchNotes(null, null, true).map { it.toUi() }
             }
         } catch (_: Exception) {
             emptyList()
@@ -1379,9 +1533,8 @@ class TaskViewModel(
     suspend fun getAllTasks(): List<TaskItem> {
         return try {
             withContext(Dispatchers.IO) {
-                checklists.filter { it.checklistType == "task" }.flatMap { cl ->
-                    core.getTasksByCategory(cl.id, null).map { it.toUi() }
-                }
+                // 按实体 kind 过滤任务（与 getAllNotes 对称），避免漏掉笔记型清单里的任务
+                core.getTasks().filter { it.kind != "note" }.map { it.toUi() }
             }
         } catch (_: Exception) {
             emptyList()

@@ -23,7 +23,10 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -53,11 +56,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import com.echonion.nion.ui.task.AttachmentButton
 import com.echonion.nion.ui.task.AttachmentList
 import com.echonion.nion.ui.task.AttachmentUiItem
+import com.echonion.nion.ui.task.ChildNode
+import com.echonion.nion.ui.task.ExpectedMinutesPickerSheet
 import com.echonion.nion.ui.task.PrioritySelector
 import com.echonion.nion.ui.task.RecurrenceSelector
 import com.echonion.nion.ui.task.ReminderTimePicker
@@ -66,6 +72,7 @@ import com.echonion.nion.ui.task.formatFocusTime
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import com.echonion.nion.ui.icons.LucideIcons
+import androidx.compose.foundation.verticalScroll
 
 /**
  * 任务详情浮层内部的面板状态：
@@ -130,6 +137,22 @@ fun TaskDetailOverlay(
     onPreviewImage: (AttachmentUiItem) -> Unit = {},
     /** 任务标题重命名回调，传入新标题 */
     onRename: (String) -> Unit = {},
+    /** 全部子孙实体（含子任务与子笔记）与其深度，用于 7.5 子项树 */
+    descendants: List<ChildNode> = emptyList(),
+    /** 关联笔记列表（已由上层按 linked_task_ids 查出） */
+    linkedNotes: List<TaskItem> = emptyList(),
+    /** 点击子项：在同一浮层内切到该实体（7.5 返回栈语义由上层维护） */
+    onOpenChild: (String) -> Unit = {},
+    /** 点击关联笔记：打开笔记编辑器 */
+    onOpenLinkedNote: (String) -> Unit = {},
+    /** 在关联笔记行点「取消关联」 */
+    onUnlinkNote: (String) -> Unit = {},
+    /** 打开关联笔记选择器 */
+    onAddLink: () -> Unit = {},
+    /** 「更多」菜单里的操作：移动清单 / 改分组 / 类型互转 / 删除 */
+    onOpenActions: () -> Unit = {},
+    /** 预计时长变更回调；null 表示清除（7.9） */
+    onUpdateExpectedMinutes: (Long?) -> Unit = {},
 ) {
     // 备注内容：初始值为任务描述，可随时编辑，每次变更自动保存
     var notes by remember(task.id) { mutableStateOf(task.description ?: "") }
@@ -218,53 +241,60 @@ fun TaskDetailOverlay(
                     }
 
                     DetailPanel.DETAIL -> {
-                        // 任务详情面板：用 Column + weight 实现自适应高度布局
-                        // 避免多次 subcompose 导致的闪烁问题
+                        // 详情面板三段式（7.5）：
+                        // ① 固定头部（标题 + kind 标签 + 多余空间不进滚动区）
+                        // ② 单一滚动正文：提醒/重复 → 预计时长 → 备注与附件 → 子项 → 关联笔记
+                        // ③ 固定底部：专注摘要 + 「添加子项」「更多」
+                        // 只用一个 verticalScroll 容器，不嵌套多个独立滚动的 Column，
+                        // 否则滚动会互相抢手势、内容多了还会被压扁。
                         Column(
-                            modifier = Modifier
-                                .heightIn(max = maxCardHeight)
-                                .padding(20.dp),
-                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                            modifier = Modifier.heightIn(max = maxCardHeight),
                         ) {
-                            // 顶部标题行，支持点击标题进入编辑模式
-                            DetailPanelHeader(
-                                taskName = task.name,
-                                onDismiss = onDismiss,
-                                onRename = onRename,
-                            )
+                            // ① 固定头部
+                            Box(modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp)) {
+                                DetailPanelHeader(
+                                    taskName = task.name,
+                                    isNote = task.isNote,
+                                    onDismiss = onDismiss,
+                                    onRename = onRename,
+                                )
+                            }
 
-                            // 循环 + 提醒快捷入口行
-                            DetailRecurrenceReminderRow(
-                                task = task,
-                                onNavigateToRecurrence = { panel = DetailPanel.RECURRENCE },
-                                onNavigateToReminder = { panel = DetailPanel.REMINDER },
-                            )
+                            // ② 单一滚动正文
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f, fill = false)
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                                verticalArrangement = Arrangement.spacedBy(16.dp),
+                            ) {
+                                // 笔记没有提醒/重复/专注语义，不展示这些任务专属入口
+                                if (!task.isNote) {
+                                    DetailRecurrenceReminderRow(
+                                        task = task,
+                                        onNavigateToRecurrence = { panel = DetailPanel.RECURRENCE },
+                                        onNavigateToReminder = { panel = DetailPanel.REMINDER },
+                                    )
 
-                            // 可编辑备注区域，weight 占据 header/footer 之外的剩余空间
-                            DetailNotesField(
-                                notes = notes,
-                                onUpdateNotes = {
-                                    notes = it
-                                    onUpdateNotes(it)
-                                },
-                                onPickImage = onPickImage,
-                                onPickFile = onPickFile,
-                                modifier = Modifier.weight(1f, fill = false),
-                            )
+                                    // 预计时长行：点击打开快捷选择（7.9）
+                                    DetailExpectedMinutesRow(
+                                        minutes = task.expectedMinutes,
+                                        onMinutesChange = { onUpdateExpectedMinutes(it) },
+                                    )
+                                }
 
-                            // 底部固定区域：专注信息 + 附件 + 工具栏，始终显示
-                            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                FocusInfoRow(
-                                    taskId = task.id,
-                                    focusSeconds = task.focusSeconds,
-                                    focusExpanded = focusExpanded,
-                                    onFocusExpandedChange = { focusExpanded = it },
-                                    selectedDuration = selectedDuration,
-                                    onSelectedDurationChange = { selectedDuration = it },
-                                    onStartFocus = onStartFocus,
+                                // 备注/正文
+                                DetailNotesField(
+                                    notes = notes,
+                                    onUpdateNotes = {
+                                        notes = it
+                                        onUpdateNotes(it)
+                                    },
+                                    onPickImage = onPickImage,
+                                    onPickFile = onPickFile,
                                 )
 
-                                // 附件列表
+                                // 附件
                                 if (attachments.isNotEmpty()) {
                                     AttachmentList(
                                         attachments = attachments,
@@ -273,10 +303,46 @@ fun TaskDetailOverlay(
                                     )
                                 }
 
-                                // 底部工具栏
+                                // 子项树：有子项才渲染；无子项不显示空框
+                                if (descendants.isNotEmpty()) {
+                                    DetailChildrenSection(
+                                        children = descendants,
+                                        onOpenChild = onOpenChild,
+                                    )
+                                }
+
+                                // 关联笔记区
+                                DetailLinkedNotesSection(
+                                    notes = linkedNotes,
+                                    onOpenNote = onOpenLinkedNote,
+                                    onUnlink = onUnlinkNote,
+                                    onAddLink = onAddLink,
+                                )
+                            }
+
+                            // ③ 固定底部：专注摘要（仅 task）+ 工具行
+                            Column(
+                                modifier = Modifier.padding(
+                                    start = 20.dp, end = 20.dp, top = 4.dp, bottom = 20.dp,
+                                ),
+                                verticalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                if (!task.isNote) {
+                                    FocusInfoRow(
+                                        taskId = task.id,
+                                        focusSeconds = task.focusSeconds,
+                                        expectedMinutes = task.expectedMinutes,
+                                        focusExpanded = focusExpanded,
+                                        onFocusExpandedChange = { focusExpanded = it },
+                                        selectedDuration = selectedDuration,
+                                        onSelectedDurationChange = { selectedDuration = it },
+                                        onStartFocus = onStartFocus,
+                                    )
+                                }
+
                                 DetailBottomToolbar(
                                     onAddSubtask = { panel = DetailPanel.ADD_SUBTASK },
-                                    onDelete = onDelete,
+                                    onMore = onOpenActions,
                                 )
                             }
                         }
@@ -594,6 +660,8 @@ private fun DetailPanelHeader(
     taskName: String,
     onDismiss: () -> Unit,
     onRename: (String) -> Unit,
+    /** 是否笔记实体：头部显示「笔记」标签而不是「任务」（7.5 固定头部要求） */
+    isNote: Boolean = false,
 ) {
     // isEditing: 是否处于标题编辑模式
     var isEditing by remember { mutableStateOf(false) }
@@ -626,9 +694,16 @@ private fun DetailPanelHeader(
 
     Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // kind 图标：一眼区分任务与笔记；视觉 18dp，外层 IconButton 保证 48dp 触摸区
+        Icon(
+            if (isNote) LucideIcons.FileText else LucideIcons.CircleCheck,
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         if (isEditing) {
             // 编辑态：显示输入框，支持 Done / 失焦保存
             OutlinedTextField(
@@ -654,14 +729,13 @@ private fun DetailPanelHeader(
                 ),
             )
         } else {
-            // 展示态：只读标题，点击进入编辑
-            Text(
-                taskName,
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier
-                    .weight(1f)
-                    .clickable(
+            // 展示态：只读标题 + 类型标签，点击标题进入编辑
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    taskName,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
                     ) {
@@ -669,7 +743,14 @@ private fun DetailPanelHeader(
                         hasBeenFocused = false
                         isEditing = true
                     },
-            )
+                )
+                // 类型标签：文字说明，不靠颜色区分（7.16 可访问性）
+                Text(
+                    if (isNote) "笔记" else "任务",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         IconButton(onClick = onDismiss) {
             Icon(LucideIcons.X, contentDescription = "关闭")
@@ -847,6 +928,8 @@ private fun DetailNotesField(
 private fun FocusInfoRow(
     taskId: String,
     focusSeconds: Long,
+    /** 预计总工时（分钟）；有值时显示「已专注 X / 预计 Y」与进度条（7.9） */
+    expectedMinutes: Long? = null,
     focusExpanded: Boolean,
     onFocusExpandedChange: (Boolean) -> Unit,
     selectedDuration: Int,
@@ -887,17 +970,47 @@ private fun FocusInfoRow(
                                 tint = MaterialTheme.colorScheme.secondary,
                             )
                             Spacer(modifier = Modifier.width(10.dp))
-                            Column {
+                            Column(modifier = Modifier.weight(1f, fill = false)) {
                                 Text(
                                     "专注时间",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
-                                Text(
-                                    formatFocusTime(focusSeconds),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Medium,
-                                )
+                                if (expectedMinutes != null) {
+                                    // 有预计时：实际 / 预计 + 进度条；超过 100% 不报错色（7.9）
+                                    val doneMin = (focusSeconds / 60).toInt()
+                                    Text(
+                                        "已专注 $doneMin 分钟 / 预计 $expectedMinutes 分钟",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    val fraction =
+                                        (doneMin.toFloat() / expectedMinutes.toFloat()).coerceIn(0f, 1f)
+                                    androidx.compose.material3.LinearProgressIndicator(
+                                        progress = { fraction },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(4.dp),
+                                        color = MaterialTheme.colorScheme.tertiary,
+                                        trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                    )
+                                    if (doneMin > expectedMinutes) {
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            // 超出预计是投入更多，不是失败，不用 error 色
+                                            "已超出预计 ${doneMin - expectedMinutes} 分钟",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                } else {
+                                    Text(
+                                        formatFocusTime(focusSeconds),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                }
                             }
                         }
                     }
@@ -1014,15 +1127,18 @@ private fun FocusInfoRow(
 }
 
 /**
- * 底部工具栏 —— 包含"添加子任务"和"删除"两个操作按钮，以分隔圆点分开。
+ * 底部工具栏 —— 「添加子项」+「更多」，以分隔圆点分开。
  *
- * @param onAddSubtask 点击添加子任务按钮时触发，通常用于切换到 ADD_SUBTASK 面板
- * @param onDelete 点击删除按钮时触发，用于删除当前任务
+ * 删除从首屏底部工具移到「更多」菜单里（7.5），降低误触：
+ * 用户在详情页最主要的行为是加子项或看更多信息，不是删掉它。
+ *
+ * @param onAddSubtask 点击添加子项按钮，切换到 ADD_SUBTASK 面板
+ * @param onMore       点击「更多」，打开操作菜单（移动/分组/互转/删除）
  */
 @Composable
 private fun DetailBottomToolbar(
     onAddSubtask: () -> Unit,
-    onDelete: () -> Unit,
+    onMore: () -> Unit,
 ) {
     Surface(
         shape = RoundedCornerShape(16.dp),
@@ -1049,7 +1165,7 @@ private fun DetailBottomToolbar(
                     modifier = Modifier.size(18.dp),
                 )
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("添加子任务", fontWeight = FontWeight.Medium)
+                Text("添加子项", fontWeight = FontWeight.Medium)
             }
             // 分隔圆点
             Text(
@@ -1057,21 +1173,318 @@ private fun DetailBottomToolbar(
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = NionAlpha.BG_SUBTLE),
             )
-            // 删除按钮
+            // 更多：移动清单 / 改分组 / 互转 / 删除（删除在菜单里，不在首屏）
             TextButton(
-                onClick = onDelete,
+                onClick = onMore,
                 colors = ButtonDefaults.textButtonColors(
-                    contentColor = MaterialTheme.colorScheme.error.copy(alpha = NionAlpha.TEXT_MEDIUM),
+                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
                 ),
             ) {
                 Icon(
-                    LucideIcons.Trash2,
+                    LucideIcons.Menu,
                     contentDescription = null,
                     modifier = Modifier.size(18.dp),
                 )
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("删除", fontWeight = FontWeight.Medium)
+                Text("更多", fontWeight = FontWeight.Medium)
             }
         }
+    }
+}
+
+// ==================== B4：子项树 / 关联笔记 / 预计时长 ====================
+
+/**
+ * 子项区 —— 紧凑树形行，展示全部子孙实体（任务与笔记混排）。
+ *
+ * 设计要点（7.5）：
+ * - 标题行 `子项` + 数量（全部子孙总数），右侧文字按钮「添加」；
+ * - 每级缩进 16dp，最大视觉缩进 3 级；更深的层级保持缩进并在标题前显示父级名辅助定位；
+ * - 深层内容超过 5 行时收进「展开全部 N 项」，展开后仍在同一滚动正文内；
+ * - 树线用 1dp outlineVariant，不穿过文字与点击区域；
+ * - 无子项时整个区块不渲染（由调用方判断），不留空框。
+ *
+ * @param children   已按树序拍平的子孙节点（含各自深度，由调用方计算）
+ * @param onOpenChild 点击子项：在同一详情浮层内切到该实体
+ */
+@Composable
+private fun DetailChildrenSection(
+    children: List<ChildNode>,
+    onOpenChild: (String) -> Unit,
+) {
+    // 超过这个条数就先折叠，避免详情页被长列表撑爆（7.5：超过 5 行显示「展开全部」）
+    val collapsedLimit = 5
+    var expanded by remember { mutableStateOf(false) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        // 标题行：`子项` + 总数 + 「添加」由底部工具条承担（此处不再重复按钮，
+        // 因为底部固定区已有「添加子项」，两个入口会造成视觉重复）
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "子项",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                // 数量指实体数，不把 task/note 混称为「子任务」
+                "${children.size}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        val visible = if (expanded) children else children.take(collapsedLimit)
+        visible.forEach { node ->
+            DetailChildRow(
+                child = node.task,
+                // 视觉缩进最多 3 级；更深层保持 3 级缩进并用父级名辅助定位
+                visualDepth = node.depth.coerceAtMost(3),
+                showParentHint = node.depth > 3,
+                onClick = { onOpenChild(node.task.id) },
+            )
+        }
+
+        if (children.size > collapsedLimit) {
+            TextButton(
+                onClick = { expanded = !expanded },
+                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+            ) {
+                Text(
+                    if (expanded) "收起" else "展开全部 ${children.size} 项",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 子项行 —— 图标（勾选圈或文档）+ 标题 + 可选预计时长。
+ *
+ * @param child         子项实体
+ * @param visualDepth   缩进层级（0..3）
+ * @param showParentHint 深层级时在标题前显示父级名，帮助定位
+ * @param onClick       点击打开该实体
+ */
+@Composable
+private fun DetailChildRow(
+    child: TaskItem,
+    visualDepth: Int,
+    showParentHint: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick,
+            )
+            // 触摸区高度至少 40dp（含文字行高），配合外层间距达到易点
+            .padding(start = (visualDepth * 16).dp, top = 6.dp, bottom = 6.dp, end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            if (child.isNote) LucideIcons.FileText else LucideIcons.CircleCheck,
+            contentDescription = null,
+            modifier = Modifier.size(16.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = buildString {
+                if (showParentHint) {
+                    // 深层级：父级名 + 分隔符，避免用户看不出这条挂在谁下面
+                    append("… › ")
+                }
+                append(child.name)
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        // 可选元信息：预计时长（笔记不显示完成状态，因此这里不画勾选/删除线）
+        child.expectedMinutes?.let { minutes ->
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                "$minutes 分钟",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/**
+ * 关联笔记区 —— 标题 + 数量 + 每条可点击的关联行（7.5）。
+ *
+ * 交互约定：
+ * - 整行点击 = 打开笔记编辑器（不在这里直接解除关联，避免误删，7.7）；
+ * - 「取消关联」通过行尾独立按钮触发（48dp 触摸区），只解除关系、不删除实体；
+ * - 无关联时显示一行轻量入口，不展示占位卡片。
+ *
+ * @param notes       关联笔记列表
+ * @param onOpenNote  点击某条关联笔记
+ * @param onUnlink    点击行尾「取消关联」
+ * @param onAddLink   点击「添加」打开关联选择器
+ */
+@Composable
+private fun DetailLinkedNotesSection(
+    notes: List<TaskItem>,
+    onOpenNote: (String) -> Unit,
+    onUnlink: (String) -> Unit,
+    onAddLink: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "关联笔记",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (notes.isNotEmpty()) {
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    "${notes.size}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(modifier = Modifier.weight(1f))
+            TextButton(
+                onClick = onAddLink,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+            ) {
+                Text("添加", style = MaterialTheme.typography.labelMedium)
+            }
+        }
+
+        if (notes.isEmpty()) {
+            // 无关联：一行轻量说明 + 入口，不做占位卡片
+            TextButton(
+                onClick = onAddLink,
+                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+            ) {
+                Text(
+                    "把相关资料放到手边 · 关联笔记",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            notes.forEach { note ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = { onOpenNote(note.id) },
+                        )
+                        .padding(start = 4.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        LucideIcons.FileText,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        note.name,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        // 标题最多两行（7.5），不塞入正文摘要
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    // 取消关联：独立 48dp 触摸区的图标按钮，描述里带实体名（可访问性要求）
+                    IconButton(
+                        onClick = { onUnlink(note.id) },
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Icon(
+                            LucideIcons.X,
+                            contentDescription = "取消关联「${note.name}」",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 详情页「预计时长」行 —— 显示当前值，点击打开快捷选择抽屉。
+ *
+ * 与新建表单里的 ExpectedMinutesRow 语义一致，但这里直接落到实体字段上。
+ *
+ * @param minutes         当前预计分钟数，null = 未设置
+ * @param onMinutesChange 变更回调；null = 清除
+ */
+@Composable
+private fun DetailExpectedMinutesRow(
+    minutes: Long?,
+    onMinutesChange: (Long?) -> Unit,
+) {
+    var showSheet by remember { mutableStateOf(false) }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = { showSheet = true },
+            )
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            LucideIcons.Timer,
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+            tint = if (minutes != null) MaterialTheme.colorScheme.secondary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            "预计时长",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.weight(1f))
+        Text(
+            minutes?.let { "$it 分钟" } ?: "未设置",
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = if (minutes != null) MaterialTheme.colorScheme.secondary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+
+    if (showSheet) {
+        // 复用独立文件里的公共抽屉，避免详情页与新建表单各写一套校验
+        ExpectedMinutesPickerSheet(
+            current = minutes,
+            onConfirm = {
+                onMinutesChange(it)
+                showSheet = false
+            },
+            onDismiss = { showSheet = false },
+        )
     }
 }

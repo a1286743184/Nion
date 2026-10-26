@@ -116,6 +116,17 @@ fun SharedTaskList(
     grandBurstTaskIds: Set<String> = emptySet(),
     /** 单个任务的完成动画全部播放完毕的回调，上层在此调用真正的 toggleDone 写入完成状态 */
     onCompletionAnimEnd: (TaskItem) -> Unit = {},
+    /**
+     * 长按原地松手（未拖动）时的回调 —— 打开该实体的操作菜单（7.7 手势仲裁）。
+     *
+     * 与既有多选行为的区别：
+     * - 长按后**拖动** = 排序（完全保留原行为）；
+     * - 长按**原地松手** = 打开操作菜单，不再直接进入多选；
+     * - 多选入口保留在菜单里的「选择多项」。
+     *
+     * 为 null 时退回旧行为（进入多选），保证其它调用点不受影响。
+     */
+    onLongPressAction: ((TaskItem) -> Unit)? = null,
 ) {
     val haptic = LocalHapticFeedback.current
 
@@ -389,8 +400,12 @@ fun SharedTaskList(
                                         pendingDragReorder = true
                                         handleDrop(reorderableItems, draggedId, reorderCallback)
                                     } else {
-                                        /* 长按未拖动 → 进入选择模式，统一切换组内选中状态 */
-                                        if (preCollapseGroupIds.size > 1) {
+                                        /* 长按未拖动（原地松手）→ 打开操作菜单（7.7）。
+                                         * 未配置 onLongPressAction 时退回旧的多选行为，
+                                         * 保证其它调用方语义不变。 */
+                                        if (onLongPressAction != null) {
+                                            onLongPressAction(flatItem.task)
+                                        } else if (preCollapseGroupIds.size > 1) {
                                             toggleIdsSelection(preCollapseGroupIds, selectedIds, onToggleSelection)
                                         } else {
                                             onToggleSelection(flatItem.task.id)
