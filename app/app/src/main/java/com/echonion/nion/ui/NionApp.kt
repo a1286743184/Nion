@@ -155,6 +155,12 @@ fun NionApp() {
      */
     var pendingOpenEntityId by remember { mutableStateOf<String?>(null) }
 
+    /**
+     * 外部请求设置页滚动到某个区块（当前仅「智能清单」，来自侧栏底部入口）。
+     * 设置页消费后清空，避免每次进设置都被强制滚动。
+     */
+    var pendingSettingsSection by remember { mutableStateOf<String?>(null) }
+
     // ── 处理来自通知栏的 Intent ──
     val activity = context as? MainActivity
     LaunchedEffect(activity?.pendingIntentAction) {
@@ -326,6 +332,12 @@ fun NionApp() {
                                 onDrag = onDrag,
                                 onDragStopped = onDragStopped,
                                 modifier = modifier,
+                                onManageSmartLists = {
+                                    // 关闭侧栏后跳到设置页；智能清单卡片在「任务与日程」区
+                                    coroutineScope.launch { dualState.closeLeft() }
+                                    pendingSettingsSection = "smart_lists"
+                                    navigateToRoute(navController, "settings")
+                                },
                             )
                         }
                     },
@@ -396,6 +408,7 @@ fun NionApp() {
                             SettingsRoute(
                                 core = core,
                                 app = app,
+                                viewModel = viewModel,
                                 currentPresetName = currentPresetName,
                                 themePalette = themePalette,
                                 onThemePaletteChange = { palette, presetName ->
@@ -541,6 +554,8 @@ private fun NionLeftPanel(
     onDrag: (Float) -> Unit,
     onDragStopped: () -> Unit,
     modifier: Modifier,
+    /** 侧栏「管理智能清单」入口：跳到设置页对应卡片 */
+    onManageSmartLists: () -> Unit = {},
 ) {
     if (currentRoute == "pomodoro") {
         FocusStatsPanel(
@@ -580,6 +595,14 @@ private fun NionLeftPanel(
             onReorderChecklists = { viewModel.reorderChecklists(it) },
             onSidebarDrag = onDrag,
             onSidebarDragStopped = onDragStopped,
+            // 智能清单由注册表驱动：可见集合 + 各自未完成计数
+            smartLists = viewModel.visibleSmartLists,
+            smartListCounts = viewModel.checklistCounts
+                .filterKeys { it != null }
+                .mapNotNull { (k, v) -> k?.let { it to v } }
+                .toMap(),
+            // 「管理智能清单」直达设置页对应卡片
+            onManageSmartLists = onManageSmartLists,
             modifier = modifier,
         )
     }
@@ -698,6 +721,12 @@ private fun SettingsRoute(
     onOpenCompanion: () -> Unit,
     /** 打开伙伴侧边栏并直达模型配置面板 */
     onOpenModelConfig: () -> Unit = onOpenCompanion,
+    /** 任务 ViewModel：智能清单与时间窗设置直接读写它的状态 */
+    viewModel: TaskViewModel,
+    /** 外部请求滚动到的设置区块（如侧栏「管理智能清单」→ "smart_lists"） */
+    requestedSection: String? = null,
+    /** 区块请求已消费 */
+    onSectionConsumed: () -> Unit = {},
 ) {
     // 将 customThemes 提升为 remember state，
     // 使得重命名/删除等操作可以直接更新 state 触发 UI 刷新
@@ -719,6 +748,11 @@ private fun SettingsRoute(
         themePalette = themePalette,
         customThemes = customThemes,
         onOpenModelConfig = onOpenModelConfig,
+        // 智能清单启用集合由 ViewModel 持有，设置页与侧栏共用同一真源
+        enabledSmartListIds = viewModel.enabledSmartListIds,
+        onSmartListToggle = { id, enabled ->
+            viewModel.setSmartListEnabled(id, enabled)
+        },
         onThemeChange = { theme ->
             onThemePaletteChange(theme.palette(), theme.name)
             try {

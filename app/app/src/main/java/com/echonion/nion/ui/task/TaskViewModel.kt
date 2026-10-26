@@ -156,18 +156,19 @@ class TaskViewModel(
     val flatTodoTasks: List<FlatTaskItem> by derivedStateOf { flattenWithGroupInfo(tasks, collapsedTaskIds) }
 
     val activeChecklistName: String
-        get() = when (activeChecklistId) {
-            TODAY_ID -> "今天"
-            INBOX_ID -> "收集箱"
-            null -> "我的任务"
-            else -> checklists.find { it.id == activeChecklistId }?.name ?: "我的任务"
+        get() {
+            // 智能清单名称从注册表取（新增清单无需再改这里）
+            SmartLists.find(activeChecklistId)?.let { return it.label }
+            return if (activeChecklistId == null) "我的任务"
+            else checklists.find { it.id == activeChecklistId }?.name ?: "我的任务"
         }
 
     /** 当前激活清单的类型："task" 或 "notebook"。虚拟清单（今天/收集箱）始终为 "task" */
     val activeChecklistType: String
-        get() = when (activeChecklistId) {
-            TODAY_ID, INBOX_ID, null -> "task"
-            else -> checklists.find { it.id == activeChecklistId }?.checklistType ?: "task"
+        get() {
+            // 智能清单是聚合视图，没有清单类型；新建默认值按 task 处理（7.6）
+            if (SmartLists.isSmart(activeChecklistId) || activeChecklistId == null) return "task"
+            return checklists.find { it.id == activeChecklistId }?.checklistType ?: "task"
         }
 
     /** 当前是否在笔记型清单视图中 */
@@ -307,6 +308,8 @@ class TaskViewModel(
     private var refreshJob: Job? = null
 
     init {
+        // 智能清单启用集合必须先读出来：侧栏与计数都依赖它
+        loadSmartListSettings()
         // 初始加载：在协程中执行
         refreshJob = viewModelScope.launch { doRefreshInternal() }
 
@@ -412,12 +415,10 @@ class TaskViewModel(
         } catch (_: Exception) { }
         try {
             val loadedTasks = withContext(Dispatchers.IO) {
-                // "今天"视图使用跨清单聚合查询
-                if (activeChecklistId == TODAY_ID) {
-                    loadTodayTasks()
-                } else if (activeChecklistId == INBOX_ID) {
-                    // "收集箱"视图加载所有 category_id = null 的孤儿任务
-                    loadTasksWithSubtasks(null, activeGroupId)
+                // 智能清单（今天/明天/本周/最近 N 天/收集箱）统一走注册表
+                val smartId = activeChecklistId
+                if (SmartLists.isSmart(smartId)) {
+                    loadSmartList(smartId!!)
                 } else {
                     loadTasksWithSubtasks(activeChecklistId, activeGroupId)
                 }
@@ -451,11 +452,8 @@ class TaskViewModel(
                     emptyList()
                 }
                 val loadedTasks = withContext(Dispatchers.IO) {
-                    if (id == TODAY_ID) {
-                        loadTodayTasks()
-                    } else if (id == INBOX_ID) {
-                        // "收集箱"视图加载所有 category_id = null 的孤儿任务
-                        loadTasksWithSubtasks(null, null)
+                    if (SmartLists.isSmart(id)) {
+                        loadSmartList(id!!)
                     } else {
                         loadTasksWithSubtasks(id, null)
                     }
@@ -996,8 +994,9 @@ class TaskViewModel(
             try {
                 withContext(Dispatchers.IO) { core.deleteChecklist(id) }
                 if (activeChecklistId == id) {
+                    // 删掉当前清单：回退到今天（智能清单一定存在且默认启用）
                     activeChecklistId = TODAY_ID
-                    tasks = withContext(Dispatchers.IO) { loadTodayTasks() }
+                    tasks = withContext(Dispatchers.IO) { loadSmartList(SmartLists.TODAY) }
                 }
                 checklists = withContext(Dispatchers.IO) { core.getChecklists().map { it.toUi() } }
                 scheduleRefreshCounts()
@@ -1067,19 +1066,20 @@ class TaskViewModel(
         val currentTasks = tasks
         val counts = withContext(Dispatchers.IO) {
             val result = mutableMapOf<String?, Pair<Int, Int>>()
-            // 当前视图的计数（可能是 "today", "inbox", null, 或清单 ID）
+            // 当前视图的计数（可能是智能清单 ID、null 或真实清单 ID）
             result[currentActiveId] = countItems(currentTasks)
-            // "今天"视图计数（如果不是当前视图则单独计算）
-            if (currentActiveId != TODAY_ID) {
-                result[TODAY_ID] = countItems(loadTodayTasks())
+            // 侧栏里可见的智能清单逐个计数（注册表遍历，不再硬编码「今天」「收集箱」）。
+            // 未启用的不计算，省掉无用的跨表查询。
+            for (def in SmartLists.visible(enabledSmartListIds)) {
+                if (def.id == currentActiveId) continue
+                result[def.id] = countItems(loadSmartList(def.id))
             }
-            // "收集箱"计数：当前视图就是收集箱时复用已有数据，否则单独查询孤儿任务
-            if (currentActiveId == INBOX_ID) {
-                result[null] = result[INBOX_ID]!!
-            } else if (currentActiveId != null) {
+            // 收集箱同时以 null 作为键，兼容旧的「我的任务」视图读取
+            result[INBOX_ID]?.let { result[null] = it }
+            if (result[null] == null && currentActiveId != INBOX_ID) {
                 result[null] = countItems(loadTasksWithSubtasks(null, null))
             }
-            // 各清单计数
+            // 各真实清单计数
             for (cl in currentChecklists) {
                 if (cl.id != currentActiveId) {
                     result[cl.id] = countItems(loadTasksWithSubtasks(cl.id, null))
@@ -1123,24 +1123,88 @@ class TaskViewModel(
     }
 
     /**
-     * 加载今日任务：reminder 日期 = 今天 或 每日循环任务。
-     * 调用 Rust 端 getTasksDueToday 获取 DailyTaskStatus，
-     * 每日任务的完成状态由 daily_completions 表决定。
-     * 子任务递归加载，不单独筛选。
+     * 已启用的智能清单 ID 集合（来自 settings，锁定项强制包含）。
+     *
+     * 变化时侧栏会立即增减条目；关闭当前所在的非默认智能清单时，
+     * 由 [setSmartListEnabled] 负责回退到今天（7.12）。
      */
-    private fun loadTodayTasks(): List<TaskItem> {
-        val todayStr = java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE)
+    var enabledSmartListIds by mutableStateOf(SmartLists.defaultEnabledIds())
+        private set
+
+    /** 侧栏要显示的智能清单（注册表顺序，已被启用集合过滤） */
+    val visibleSmartLists: List<SmartListDef>
+        get() = SmartLists.visible(enabledSmartListIds)
+
+    /** 从 settings 读取智能清单启用集合；缺失或损坏时回默认值 */
+    fun loadSmartListSettings() {
+        try {
+            val raw = core.getSetting(SETTING_SMART_LISTS)
+            val stored = if (raw.isNullOrBlank()) {
+                SmartLists.defaultEnabledIds()
+            } else {
+                raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            }
+            // 锁定项强制启用，避免设置损坏导致空侧栏
+            enabledSmartListIds = SmartLists.effectiveEnabledIds(stored)
+        } catch (_: Exception) {
+            enabledSmartListIds = SmartLists.defaultEnabledIds()
+        }
+    }
+
+    /**
+     * 启用/停用某个智能清单。
+     *
+     * 锁定项（今天、收集箱）直接忽略请求 —— 界面上也不给 Switch，
+     * 这里再兜一层，防止通过其它路径把侧栏关空。
+     *
+     * @param id      智能清单 ID
+     * @param enabled 目标状态
+     * @param onSwitchedAway 关闭当前所在清单并回退到今天的回调（用于提示用户）
+     */
+    fun setSmartListEnabled(id: String, enabled: Boolean, onSwitchedAway: (() -> Unit)? = null) {
+        val def = SmartLists.find(id) ?: return
+        if (def.locked) return
+        val next = if (enabled) enabledSmartListIds + id else enabledSmartListIds - id
+        enabledSmartListIds = SmartLists.effectiveEnabledIds(next)
+        try {
+            core.setSetting(SETTING_SMART_LISTS, enabledSmartListIds.joinToString(","))
+        } catch (e: Exception) {
+            onError("保存智能清单设置失败: ${e.message}")
+        }
+        // 关闭的正是当前所在清单：先回退到今天，再移除，避免停留在「已隐藏的视图」
+        if (!enabled && activeChecklistId == id) {
+            setActiveChecklist(TODAY_ID)
+            onSwitchedAway?.invoke()
+        }
+    }
+
+    /**
+     * 按注册表口径加载某个智能清单。
+     *
+     * 与旧 loadTodayTasks 的差异：口径统一由 [SmartLists.aggregate] 决定，
+     * 这里只负责「取顶层实体 → 过滤 → 递归挂子项」的通用流程。
+     *
+     * @param smartListId 智能清单 ID
+     */
+    private fun loadSmartList(smartListId: String): List<TaskItem> {
+        val today = java.time.LocalDate.now()
         fun loadChildren(parentId: String): List<TaskItem> {
             return core.getSubtasks(parentId).map { task ->
                 val subs = loadChildren(task.id)
                 task.toUi().copy(subtasks = subs)
             }
         }
-        return core.getTasksDueToday(todayStr).map { status ->
-            val subs = loadChildren(status.task.id)
-            status.toUi().copy(subtasks = subs)
-        }
+        // 顶层实体：先取全量再按注册表过滤（实体数量级为个人清单，
+        // 全量取一次比按清单逐个查询再合并更简单，也避免多次跨清单 I/O）
+        val allTop = core.getTasks().filter { it.parentId == null }
+        return SmartLists.aggregate(smartListId, today, allTop.map { it.toUi() })
+            .map { item ->
+                // 需要原始 TaskData 才能递归查子项；这里用已映射的 UI 模型 ID 查
+                val subs = loadChildren(item.id)
+                item.copy(subtasks = subs)
+            }
     }
+
 
     /**
      * 根据当前活跃视图加载任务数据。
@@ -1149,10 +1213,10 @@ class TaskViewModel(
      * 其他 → 指定清单查询。
      */
     private suspend fun loadTasksForCurrentView(): List<TaskItem> = withContext(Dispatchers.IO) {
-        if (activeChecklistId == TODAY_ID) {
-            loadTodayTasks()
-        } else if (activeChecklistId == INBOX_ID) {
-            loadTasksWithSubtasks(null, activeGroupId)
+        // 智能清单统一走注册表；真实清单走原来的清单查询
+        val smartId = activeChecklistId
+        if (SmartLists.isSmart(smartId)) {
+            loadSmartList(smartId!!)
         } else {
             loadTasksWithSubtasks(activeChecklistId, activeGroupId)
         }
@@ -1554,6 +1618,9 @@ class TaskViewModel(
          * 任何没有关联清单的任务都会自动出现在此视图中。
          */
         const val INBOX_ID = "inbox"
+
+        /** settings 键：已启用的智能清单 ID（逗号分隔） */
+        const val SETTING_SMART_LISTS = "smart_lists_enabled"
     }
 }
 

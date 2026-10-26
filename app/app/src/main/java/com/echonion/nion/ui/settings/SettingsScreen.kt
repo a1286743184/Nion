@@ -65,6 +65,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -90,6 +92,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.echonion.nion.core
 import com.echonion.nion.reminder.NotificationHelper
+import com.echonion.nion.ui.task.SmartLists
+import com.echonion.nion.ui.task.TimeWindow
+import com.echonion.nion.ui.task.TimeWindows
 import uniffi.nion_core.NionCore
 import com.echonion.nion.ui.companion.weather.LocationHelper
 import com.echonion.nion.ui.companion.phoneagent.PhoneAgentBridge
@@ -134,6 +139,18 @@ fun SettingsScreen(
     onOpenCompanion: () -> Unit = {},
     /** 打开伙伴侧边栏并直达模型配置面板（Provider/API Key/模型/思考强度） */
     onOpenModelConfig: () -> Unit = onOpenCompanion,
+    /** 当前启用的智能清单 ID 集合（来自 TaskViewModel） */
+    enabledSmartListIds: Set<String> = SmartLists.defaultEnabledIds(),
+    /** 切换智能清单启用状态 */
+    onSmartListToggle: (String, Boolean) -> Unit = { _, _ -> },
+    /** 保存每日时间窗 */
+    onDailyTimeWindowsChange: (List<TimeWindow>) -> Unit = {},
+    /**
+     * 外部请求滚动到的设置区块（当前仅 "smart_lists"）。
+     * 侧栏底部「管理智能清单」会把用户送到这里；消费后由上层清空。
+     */
+    requestedSection: String? = null,
+    onSectionConsumed: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val app = context.applicationContext as android.app.Application
@@ -142,6 +159,27 @@ fun SettingsScreen(
 
     // ── 位置权限状态 ──
     var hasLocationPermission by remember { mutableStateOf(false) }
+
+    // ── 设置页滚动状态 ──（外部请求要能把它滚到「任务与日程」区）
+    val scrollState = rememberScrollState()
+    // 智能清单卡片在页面里的位置：用 onGloballyPositioned 记录，供外部请求滚动
+    var smartListCardY by remember { mutableStateOf(0f) }
+    // 记录点击「管理智能清单」时卡片相对滚动容器的偏移
+    var smartListOffsetInScroll by remember { mutableStateOf(0f) }
+    LaunchedEffect(requestedSection) {
+        if (requestedSection == "smart_lists") {
+            // 滚到卡片位置（留一点顶部余量，避免贴着标题栏）
+            scrollState.animateScrollTo(
+                (smartListOffsetInScroll - 24f).coerceAtLeast(0f).toInt(),
+            )
+            onSectionConsumed()
+        }
+    }
+
+    // ── 每日时间窗状态 ──（读 settings；保存后立即回写并刷新摘要）
+    var dailyTimeWindows by remember {
+        mutableStateOf(TimeWindows.fromJson(core.getSetting(TimeWindows.SETTING_KEY)))
+    }
 
     // ── 位置信息状态 ──
     var locationDisplayText by remember { mutableStateOf("未定位") }
@@ -210,7 +248,7 @@ fun SettingsScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
                 .padding(horizontal = 16.dp)
-                .verticalScroll(rememberScrollState()),
+                .verticalScroll(scrollState),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             // ── AI 模型配置入口 ──
@@ -315,6 +353,47 @@ fun SettingsScreen(
                     sharedTransitionScope = this@SharedTransitionLayout,
                 )
             }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // ── 任务与日程区域（7.11 / 7.12 的落点）──
+            // 放在主题之后、权限之前：这两项是使用习惯配置，不属权限范畴，
+            // 继续堆进权限区会让用户以为它们是「必须开启的开关」。
+            Text(
+                "任务与日程",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+
+            Box(modifier = Modifier.onGloballyPositioned { coords ->
+                // positionInParent 给出该 Box 在父布局（滚动内容 Column）内的 y 偏移，
+                // 正是 scrollState 需要滚动到的位置
+                smartListOffsetInScroll = coords.positionInParent().y
+                smartListCardY = coords.positionInParent().y
+            }) {
+                SmartListsSettingsCard(
+                    smartLists = SmartLists.all,
+                    enabledIds = enabledSmartListIds,
+                    onToggle = onSmartListToggle,
+                )
+            }
+
+            DailyTimeWindowsCard(
+                windows = dailyTimeWindows,
+                onSave = { windows ->
+                    // 只有保存才写库；写失败保留原值并提示
+                    try {
+                        core.setSetting(TimeWindows.SETTING_KEY, TimeWindows.toJson(windows))
+                        dailyTimeWindows = windows
+                    } catch (e: Exception) {
+                        Toast.makeText(context, "保存时间窗失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                    onDailyTimeWindowsChange(windows)
+                },
+            )
 
             Spacer(modifier = Modifier.height(8.dp))
 

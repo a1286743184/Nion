@@ -101,6 +101,12 @@ fun SidebarContent(
     onSidebarDrag: (Float) -> Unit,
     onSidebarDragStopped: () -> Unit,
     modifier: Modifier = Modifier,
+    /** 当前启用的智能清单（注册表顺序，已按设置过滤） */
+    smartLists: List<SmartListDef> = SmartLists.visible(SmartLists.defaultEnabledIds()),
+    /** 智能清单的未完成计数，key = 智能清单 ID */
+    smartListCounts: Map<String, Pair<Int, Int>> = emptyMap(),
+    /** 底部「管理智能清单」入口，直达设置页对应卡片 */
+    onManageSmartLists: (() -> Unit)? = null,
 ) {
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
     var isAdding by remember { mutableStateOf(false) }
@@ -131,10 +137,15 @@ fun SidebarContent(
     var wasMoved by remember { mutableStateOf(false) }
 
     /**
-     * 固定项数量（"今天" + "收集箱"），用于计算拖拽排序的索引偏移。
-     * 固定项不参与拖拽排序，位于 LazyColumn 列表头部。
+     * 固定项数量 = 启用的智能清单数 + 分组标题数量。
+     * 智能清单不可拖拽排序，位于 LazyColumn 头部；真实清单的索引需要这个偏移。
+     *
+     * 结构： [smart_header]? + N 个智能清单 + [custom_header]?
+     * 标题只在对应分组非空时出现，因此分开计算而不是写死数字。
      */
-    val headerCount = 2
+    val headerCount = smartLists.size +
+        (if (smartLists.isNotEmpty()) 1 else 0) +
+        (if (reorderableChecklists.isNotEmpty()) 1 else 0)
 
     val reorderableState = rememberReorderableLazyListState(
         lazyListState = listState,
@@ -176,32 +187,55 @@ fun SidebarContent(
                 verticalArrangement = Arrangement.spacedBy(4.dp),
                 modifier = Modifier.weight(1f),
             ) {
-                item(key = "today") {
-                    SidebarChecklistItem(
-                        name = "今天",
-                        taskCount = defaultCounts.first,
-                        subtaskCount = defaultCounts.second,
-                        isActive = activeChecklistId == TaskViewModel.TODAY_ID,
-                        onClick = { onSelectChecklist(TaskViewModel.TODAY_ID) },
-                        showDelete = false,
-                        onDelete = {},
-                    )
-                }
                 /**
-                 * "收集箱"固定项 —— 显示所有未分配清单的孤儿任务（category_id = null）。
-                 * 不可删除，不可拖拽排序，始终排在"今天"之后。
+                 * 智能清单区（7.12）—— 扁平列表、固定顺序、不可拖拽、不可删除。
+                 *
+                 * 顺序与可见性来自注册表，新增智能清单不需要再改这里；
+                 * 计数按「未完成 task 数」显示，note 不进入待办计数
+                 * （但打开该清单后的列表与顶部统计仍会显示笔记）。
                  */
-                item(key = "inbox") {
-                    SidebarChecklistItem(
-                        name = "收集箱",
-                        taskCount = inboxCounts.first,
-                        subtaskCount = inboxCounts.second,
-                        isActive = activeChecklistId == TaskViewModel.INBOX_ID,
-                        onClick = { onSelectChecklist(TaskViewModel.INBOX_ID) },
-                        showDelete = false,
-                        onDelete = {},
-                    )
+                if (smartLists.isNotEmpty()) {
+                    item(key = "smart_header", contentType = "header") {
+                        Text(
+                            "智能清单",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 4.dp, top = 4.dp, bottom = 2.dp),
+                        )
+                    }
+                    items(smartLists, key = { it.id }, contentType = { "smart" }) { def ->
+                        // 今天/收集箱沿用既有计数来源，其余取自注册表计数表
+                        val counts = when (def.id) {
+                            SmartLists.TODAY -> defaultCounts
+                            SmartLists.INBOX -> inboxCounts
+                            else -> smartListCounts[def.id] ?: Pair(0, 0)
+                        }
+                        SidebarChecklistItem(
+                            name = def.label,
+                            taskCount = counts.first,
+                            subtaskCount = counts.second,
+                            isActive = activeChecklistId == def.id,
+                            onClick = { onSelectChecklist(def.id) },
+                            showDelete = false,
+                            onDelete = {},
+                        )
+                    }
                 }
+
+                // 「我的清单」小标题：与智能清单用弱分隔区分，而不是另一层可折叠树
+                if (reorderableChecklists.isNotEmpty()) {
+                    item(key = "custom_header", contentType = "header") {
+                        Text(
+                            "我的清单",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 4.dp, top = 12.dp, bottom = 2.dp),
+                        )
+                    }
+                }
+
                 items(
                     items = reorderableChecklists,
                     key = { it.id },
@@ -270,6 +304,20 @@ fun SidebarContent(
                 visible = !isAdding,
                 onClick = { isAdding = true },
             )
+
+            // 「管理智能清单」：文字入口直达设置页，不挤进新建清单按钮
+            if (onManageSmartLists != null) {
+                TextButton(
+                    onClick = onManageSmartLists,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        "管理智能清单",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
 
