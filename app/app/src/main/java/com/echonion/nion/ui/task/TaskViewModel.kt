@@ -304,6 +304,16 @@ class TaskViewModel(
 
     val isSelectionMode: Boolean by derivedStateOf { selectedTaskIds.isNotEmpty() }
 
+    /**
+     * 已启用的智能清单 ID 集合（来自 settings，锁定项强制包含）。
+     *
+     * 变化时侧栏会立即增减条目；关闭当前所在的非默认智能清单时，
+     * 由 [setSmartListEnabled] 负责回退到今天（7.12）。
+     */
+    var enabledSmartListIds by mutableStateOf(SmartLists.defaultEnabledIds())
+        private set
+
+
     /** 当前正在执行的刷新协程，用于 cancelPrevious 防止并发刷新导致旧数据覆盖新数据 */
     private var refreshJob: Job? = null
 
@@ -1121,15 +1131,6 @@ class TaskViewModel(
             task.toUi().copy(subtasks = subs)
         }
     }
-
-    /**
-     * 已启用的智能清单 ID 集合（来自 settings，锁定项强制包含）。
-     *
-     * 变化时侧栏会立即增减条目；关闭当前所在的非默认智能清单时，
-     * 由 [setSmartListEnabled] 负责回退到今天（7.12）。
-     */
-    var enabledSmartListIds by mutableStateOf(SmartLists.defaultEnabledIds())
-        private set
 
     /** 侧栏要显示的智能清单（注册表顺序，已被启用集合过滤） */
     val visibleSmartLists: List<SmartListDef>

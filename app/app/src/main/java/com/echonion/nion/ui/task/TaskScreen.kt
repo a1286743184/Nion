@@ -468,7 +468,11 @@ fun TaskScreen(
                             viewModel.unlinkNoteFromTask(noteId, taskId)
                         },
                         onAddLink = { showLinkPicker = true },
-                        onOpenActions = { showActionsSheet = true },
+                        onOpenActions = {
+                            // 详情页「更多」：目标是当前展开的实体（长按菜单的目标是列表项）
+                            actionTarget = task
+                            showActionsSheet = true
+                        },
                     )
                     }
                 }
@@ -593,75 +597,6 @@ fun TaskScreen(
                         )
                     }
 
-                    // ── 长按操作菜单（7.7）──
-                    actionTarget?.let { target ->
-                        EntityActionsSheet(
-                            task = target,
-                            // 智能清单是聚合视图，不能作为移动目标，因此只列真实清单
-                            checklists = viewModel.checklists,
-                            currentGroups = actionGroups,
-                            onRequestGroups = { checklistId ->
-                                // 切换目标清单时同步加载它的分组，避免按旧清单的分组移动
-                                scope.launch {
-                                    actionGroups = viewModel.groupsOf(checklistId)
-                                }
-                            },
-                            onMove = { checklistId, groupId ->
-                                viewModel.moveEntity(target.id, checklistId, groupId)
-                                actionTarget = null
-                            },
-                            onSwitchKind = { newKind ->
-                                viewModel.switchKind(target.id, newKind)
-                                actionTarget = null
-                            },
-                            onEnterSelectionMode = {
-                                viewModel.toggleSelection(target.id)
-                            },
-                            onDelete = {
-                                // 先收菜单再弹确认（不叠两个弹窗）
-                                actionTarget = null
-                                pendingDelete = target
-                            },
-                            onDismiss = { actionTarget = null },
-                        )
-                    }
-
-                    // ── 删除确认（7.7 删除保护）──
-                    pendingDelete?.let { target ->
-                        DeleteEntityDialog(
-                            task = target,
-                            childCount = target.subtasks.size,
-                            deleting = deleting,
-                            onConfirm = {
-                                deleting = true
-                                viewModel.deleteEntity(target.id)
-                                // 删除是异步的：立刻关闭弹窗与详情，失败由 Snackbar 提示
-                                deleting = false
-                                pendingDelete = null
-                                if (expandedTaskId == target.id) expandedTaskId = null
-                            },
-                            onDismiss = { pendingDelete = null },
-                        )
-                    }
-
-                    // ── 详情页「关联笔记」选择器（7.5）──
-                    if (showLinkPicker) {
-                        // 只列 kind=note 的实体，并预勾选已关联项
-                        val linkedIds = viewModel.linkedNotes.map { it.id }.toSet()
-                        com.echonion.nion.ui.notebook.LinkItemDialog(
-                            title = "关联笔记",
-                            items = linkCandidates,
-                            linkedIds = linkedIds,
-                            onLink = { noteId ->
-                                expandedTaskId?.let { viewModel.linkNoteToTask(noteId, it) }
-                            },
-                            onUnlink = { noteId ->
-                                expandedTaskId?.let { viewModel.unlinkNoteFromTask(noteId, it) }
-                            },
-                            onDismiss = { showLinkPicker = false },
-                        )
-                    }
-
                     // 添加笔记浮层（笔记型清单）
                     AnimatedVisibility(
                         visible = showAddNote,
@@ -690,6 +625,75 @@ fun TaskScreen(
                     }
                 }
             }
+        }
+
+        // ══ 全局弹层（7.5 / 7.7）══
+        // 必须在 AnimatedContent 之外：详情打开时列表分支不组合，
+        // 放在里面会让「更多」菜单、删除确认、关联选择器在详情页里永远不出现。
+
+        // 长按操作菜单 / 详情「更多」共用同一个抽屉
+        actionTarget?.let { target ->
+            EntityActionsSheet(
+                task = target,
+                // 智能清单是聚合视图，不能作为移动目标，因此只列真实清单
+                checklists = viewModel.checklists,
+                currentGroups = actionGroups,
+                onRequestGroups = { checklistId ->
+                    // 切换目标清单时同步加载它的分组，避免按旧清单的分组移动
+                    scope.launch { actionGroups = viewModel.groupsOf(checklistId) }
+                },
+                onMove = { checklistId, groupId ->
+                    viewModel.moveEntity(target.id, checklistId, groupId)
+                    actionTarget = null
+                },
+                onSwitchKind = { newKind ->
+                    viewModel.switchKind(target.id, newKind)
+                    actionTarget = null
+                },
+                onEnterSelectionMode = { viewModel.toggleSelection(target.id) },
+                onDelete = {
+                    // 先收菜单再弹确认（不叠两个弹窗）
+                    actionTarget = null
+                    pendingDelete = target
+                },
+                onDismiss = { actionTarget = null },
+            )
+        }
+
+        // 删除确认（子项上移一级，如实说明）
+        pendingDelete?.let { target ->
+            DeleteEntityDialog(
+                task = target,
+                childCount = target.subtasks.size,
+                deleting = deleting,
+                onConfirm = {
+                    deleting = true
+                    viewModel.deleteEntity(target.id)
+                    // 删除是异步的：立刻关闭弹窗与详情，失败由 Snackbar 提示
+                    deleting = false
+                    pendingDelete = null
+                    if (expandedTaskId == target.id) expandedTaskId = null
+                },
+                onDismiss = { pendingDelete = null },
+            )
+        }
+
+        // 详情页「关联笔记」选择器
+        if (showLinkPicker) {
+            // 只列 kind=note 的实体，并预勾选已关联项
+            val linkedIds = viewModel.linkedNotes.map { it.id }.toSet()
+            com.echonion.nion.ui.notebook.LinkItemDialog(
+                title = "关联笔记",
+                items = linkCandidates,
+                linkedIds = linkedIds,
+                onLink = { noteId ->
+                    expandedTaskId?.let { viewModel.linkNoteToTask(noteId, it) }
+                },
+                onUnlink = { noteId ->
+                    expandedTaskId?.let { viewModel.unlinkNoteFromTask(noteId, it) }
+                },
+                onDismiss = { showLinkPicker = false },
+            )
         }
     }
 }
